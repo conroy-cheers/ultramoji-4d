@@ -1,0 +1,19 @@
+display_information:
+  name: Slack Emoji Billboard
+features:
+  bot_user:
+    display_name: Slack Emoji Billboard
+    always_online: false
+oauth_config:
+  redirect_urls:
+    - http://127.0.0.1:8765/
+    - https://example.com/ultramoji/
+  scopes:
+    user:
+      - emoji:read
+settings:
+  interactivity:
+    is_enabled: false
+  org_deploy_enabled: false
+  socket_mode_enabled: false
+  token_rotation_enabled: true

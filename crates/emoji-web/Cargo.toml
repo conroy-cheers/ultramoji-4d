@@ -1,0 +1,35 @@
+[package]
+name = "emoji-web"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
+
+[dependencies]
+emoji-renderer = { path = "../emoji-renderer" }
+ratatui = { version = "0.30", default-features = false, features = ["underline-color"] }
+fontdue = "0.9"
+wgpu = { version = "24", features = ["webgl"] }
+egui = "0.31"
+egui-wgpu = "0.31"
+bytemuck = { version = "1", features = ["derive"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = [
+    "Window",
+    "Document",
+    "HtmlCanvasElement",
+    "Element",
+    "Performance",
+    "console",
+    "KeyboardEvent",
+    "MouseEvent",
+    "WheelEvent",
+    "EventTarget",
+] }
+anyhow = "1"

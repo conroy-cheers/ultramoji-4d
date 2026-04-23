@@ -1,0 +1,12 @@
+{
+  "name": "emoji-web-perf",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "bench": "node run.mjs",
+    "install:browsers": "playwright install chromium"
+  },
+  "devDependencies": {
+    "playwright": "^1.53.0"
+  }
+}

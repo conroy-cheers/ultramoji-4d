@@ -1,0 +1,7 @@
+/target/
+/result
+/crates/emoji-web/static/pkg/
+/crates/emoji-web/__pycache__/
+/crates/emoji-web/perf/node_modules/
+/crates/emoji-web/perf/out/
+*.pyc
