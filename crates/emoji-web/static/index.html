@@ -89,6 +89,7 @@ try {
     set_active_emoji_texture_bytes,
     set_gallery_entries,
     set_hosted_auth_state,
+    set_ambient_light_config,
     set_perf_toggles,
     set_render_config,
     set_shadow_render_config,
@@ -132,10 +133,17 @@ try {
       mode = 1,
       strength = 1.0,
       maxDarkness = 1.0,
+      contact = true,
       bins = 96,
       resolution = 256,
     } = {}) {
-      set_shadow_render_config(mode, strength, maxDarkness, bins, resolution);
+      set_shadow_render_config(mode, strength, maxDarkness, contact, bins, resolution);
+    },
+    setAmbient({
+      tint = 0.67,
+      brightness = 0.11,
+    } = {}) {
+      set_ambient_light_config(tint, brightness);
     },
     setTransfer({
       linearGain = 1.15,

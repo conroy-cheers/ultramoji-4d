@@ -6,3 +6,4 @@
 /crates/emoji-web/perf/out/
 *.pyc
 /.direnv
+.omx/

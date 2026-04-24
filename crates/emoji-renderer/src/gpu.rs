@@ -14,6 +14,8 @@ pub struct SceneParams {
     pub bob: Option<f32>,
     pub fill: Option<f32>,
     pub bg_color: Option<[f32; 3]>,
+    pub ambient_light_tint: Option<f32>,
+    pub ambient_light_brightness: Option<f32>,
     pub sharpen: Option<f32>,
     pub contrast: Option<f32>,
     pub dither: Option<f32>,
@@ -30,6 +32,14 @@ pub struct SceneParams {
     pub ssao_bbox_padding: Option<f32>,
     pub ssao_steps: Option<u32>,
     pub ssao_empty_depth_mode: Option<u32>,
+    pub contact_shadows: Option<bool>,
+    pub contact_shadow_depth_threshold: Option<f32>,
+    pub contact_shadow_start_dist: Option<f32>,
+    pub contact_shadow_step_dist: Option<f32>,
+    pub contact_shadow_max_dist: Option<f32>,
+    pub contact_shadow_max_depth_delta: Option<f32>,
+    pub contact_shadow_jitter_spread: Option<f32>,
+    pub contact_shadow_steps: Option<u32>,
     pub shadow_mode: Option<u32>,
     pub precomputed_shadow_bins: Option<u32>,
     pub precomputed_shadow_resolution: Option<u32>,
@@ -77,6 +87,11 @@ struct Uniforms {
     camera_pos: [f32; 4],
     shadow_map_params: [f32; 4],
     precomputed_shadow_params: [f32; 4],
+    ambient_light_params: [f32; 4],
+    contact_shadow_params: [f32; 4],
+    contact_shadow_march: [f32; 4],
+    contact_shadow_screen: [f32; 4],
+    contact_shadow_bounds: [f32; 4],
     ground_y: f32,
     debug_flags: u32,
     near: f32,
@@ -355,6 +370,7 @@ pub struct GpuRenderer {
     shadow_pipeline: wgpu::RenderPipeline,
     shadow_color_pipeline: Option<wgpu::RenderPipeline>,
     shadow_map_pipeline: wgpu::RenderPipeline,
+    contact_depth_pipeline: wgpu::RenderPipeline,
     _shadow_map_bind_group_layout: wgpu::BindGroupLayout,
     shadow_map_bind_group: wgpu::BindGroup,
     _shadow_map_texture: wgpu::Texture,
@@ -363,7 +379,6 @@ pub struct GpuRenderer {
     precomputed_shadow_pipeline: wgpu::RenderPipeline,
     precomputed_shadow_depth_pipeline: wgpu::RenderPipeline,
     precomputed_shadow_bind_group_layout: wgpu::BindGroupLayout,
-    precomputed_shadow_fallback_bind_group: wgpu::BindGroup,
     precomputed_shadow_sampler: wgpu::Sampler,
     _precomputed_shadow_fallback_texture: wgpu::Texture,
     precomputed_shadow_state: Option<PrecomputedShadowState>,
@@ -432,6 +447,8 @@ struct RenderTargetState {
     color_texture: wgpu::Texture,
     color_view: wgpu::TextureView,
     linear_depth_view: wgpu::TextureView,
+    contact_depth_view: wgpu::TextureView,
+    contact_depth_stencil_view: wgpu::TextureView,
     ssao_output_texture: wgpu::Texture,
     ssao_output_view: wgpu::TextureView,
     downsample_output_texture: Option<wgpu::Texture>,
@@ -465,7 +482,6 @@ struct PrecomputedShadowKey {
 struct PrecomputedShadowState {
     key: PrecomputedShadowKey,
     texture: wgpu::Texture,
-    bind_group: wgpu::BindGroup,
     ready: Vec<bool>,
 }
 
@@ -573,6 +589,16 @@ impl GpuRenderer {
                         binding: 1,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        },
                         count: None,
                     },
                 ],
@@ -781,6 +807,43 @@ impl GpuRenderer {
             multiview: None,
             cache: None,
         });
+        let contact_depth_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("contact_depth_pipeline"),
+                layout: Some(&shadow_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_contact_depth"),
+                    buffers: &[vertex_buffer_layout()],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_contact_depth"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: linear_depth_format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth24PlusStencil8,
+                    depth_write_enabled: true,
+                    depth_compare: wgpu::CompareFunction::Less,
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+                cache: None,
+            });
         let precomputed_shadow_pipeline =
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("precomputed_shadow_pipeline"),
@@ -1243,31 +1306,6 @@ impl GpuRenderer {
             wgpu::util::TextureDataOrder::LayerMajor,
             &[0, 0, 0, 255],
         );
-        let precomputed_shadow_fallback_view =
-            precomputed_shadow_fallback_texture.create_view(&wgpu::TextureViewDescriptor {
-                label: Some("precomputed_shadow_fallback_view"),
-                dimension: Some(wgpu::TextureViewDimension::D2Array),
-                array_layer_count: Some(1),
-                ..Default::default()
-            });
-        let precomputed_shadow_fallback_bind_group =
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("precomputed_shadow_fallback_bg"),
-                layout: &precomputed_shadow_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(
-                            &precomputed_shadow_fallback_view,
-                        ),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&precomputed_shadow_sampler),
-                    },
-                ],
-            });
-
         let (vertices, indices) = billboard_geometry_rect(1.0, 0.1, true);
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("vertices"),
@@ -1288,6 +1326,7 @@ impl GpuRenderer {
             shadow_pipeline,
             shadow_color_pipeline,
             shadow_map_pipeline,
+            contact_depth_pipeline,
             _shadow_map_bind_group_layout: shadow_map_bind_group_layout,
             shadow_map_bind_group,
             _shadow_map_texture: shadow_map_texture,
@@ -1296,7 +1335,6 @@ impl GpuRenderer {
             precomputed_shadow_pipeline,
             precomputed_shadow_depth_pipeline,
             precomputed_shadow_bind_group_layout,
-            precomputed_shadow_fallback_bind_group,
             precomputed_shadow_sampler,
             _precomputed_shadow_fallback_texture: precomputed_shadow_fallback_texture,
             precomputed_shadow_state: None,
@@ -1753,40 +1791,11 @@ impl GpuRenderer {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
-        let view = texture.create_view(&wgpu::TextureViewDescriptor {
-            label: Some("precomputed_shadow_view"),
-            dimension: Some(wgpu::TextureViewDimension::D2Array),
-            array_layer_count: Some(key.layers),
-            ..Default::default()
-        });
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("precomputed_shadow_bg"),
-            layout: &self.precomputed_shadow_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.precomputed_shadow_sampler),
-                },
-            ],
-        });
-
         self.precomputed_shadow_state = Some(PrecomputedShadowState {
             key,
             texture,
-            bind_group,
             ready: vec![false; key.layers as usize],
         });
-    }
-
-    fn precomputed_shadow_bind_group(&self) -> &wgpu::BindGroup {
-        self.precomputed_shadow_state
-            .as_ref()
-            .map(|state| &state.bind_group)
-            .unwrap_or(&self.precomputed_shadow_fallback_bind_group)
     }
 
     fn precomputed_shadow_ready(&self, layer: u32) -> bool {
@@ -1968,6 +1977,41 @@ impl GpuRenderer {
         let precomputed_physical_layers = precomputed_bins * 2;
         let precomputed_bin = Self::precomputed_shadow_bin(spin, precomputed_bins);
         let precomputed_layer_base = precomputed_bin * 2;
+        let ambient_light_params = [
+            params
+                .ambient_light_brightness
+                .unwrap_or(0.11)
+                .clamp(0.0, 1.0),
+            params.ambient_light_tint.unwrap_or(0.67).clamp(0.0, 1.0),
+            0.0,
+            0.0,
+        ];
+        let (scene_w, scene_h) = {
+            let rt = self.render_target.as_ref().unwrap();
+            (rt.scene_width as f32, rt.scene_height as f32)
+        };
+        let bbox_padding = params.ssao_bbox_padding.unwrap_or(0.1);
+        let (bbox_min, bbox_max) =
+            screen_aabb_from_mvp(&mvp, billboard_h, bbox_padding, scene_w, scene_h);
+        let p0 = mat4_transform_point(&ground_mvp, [0.0, 0.0, 0.0, 1.0]);
+        let p1 = mat4_transform_point(&ground_mvp, [light_dir[0], light_dir[1], light_dir[2], 1.0]);
+        let ndc0 = [p0[0] / p0[3], p0[1] / p0[3], p0[2] / p0[3]];
+        let ndc1 = [p1[0] / p1[3], p1[1] / p1[3], p1[2] / p1[3]];
+        let delta_ndc = [ndc1[0] - ndc0[0], -(ndc1[1] - ndc0[1]), ndc1[2] - ndc0[2]];
+        let delta_screen = [delta_ndc[0] * scene_w * 0.5, delta_ndc[1] * scene_h * 0.5];
+        let screen_len =
+            (delta_screen[0] * delta_screen[0] + delta_screen[1] * delta_screen[1]).sqrt();
+        let (screen_dir, dz_ndc_per_px) = if screen_len > 0.001 {
+            (
+                [delta_screen[0] / screen_len, delta_screen[1] / screen_len],
+                delta_ndc[2] / screen_len,
+            )
+        } else {
+            ([0.0, 0.0], 0.0)
+        };
+        let ref_height = 720.0f32;
+        let res_scale = scene_h / ref_height;
+        let contact_enabled = shadow_mode == 1 && params.contact_shadows.unwrap_or(true);
 
         let uniforms = Uniforms {
             mvp,
@@ -1990,6 +2034,33 @@ impl GpuRenderer {
                 0.0,
                 0.0,
             ],
+            ambient_light_params,
+            contact_shadow_params: [
+                params.ssao_strength.unwrap_or(10.0).clamp(0.0, 1.0),
+                params.ssao_max_shadow.unwrap_or(0.4).clamp(0.0, 1.0),
+                params.contact_shadow_depth_threshold.unwrap_or(0.003),
+                params.contact_shadow_max_depth_delta.unwrap_or(0.1),
+            ],
+            contact_shadow_march: [
+                params.contact_shadow_start_dist.unwrap_or(0.75) * res_scale,
+                params.contact_shadow_step_dist.unwrap_or(0.85) * res_scale,
+                params.contact_shadow_max_dist.unwrap_or(12.0) * res_scale,
+                params.contact_shadow_steps.unwrap_or(16).clamp(1, 64) as f32,
+            ],
+            contact_shadow_screen: [
+                screen_dir[0],
+                screen_dir[1],
+                dz_ndc_per_px,
+                if contact_enabled {
+                    1.0 + params
+                        .contact_shadow_jitter_spread
+                        .unwrap_or(0.08)
+                        .clamp(0.0, 1.0)
+                } else {
+                    0.0
+                },
+            ],
+            contact_shadow_bounds: [bbox_min[0], bbox_min[1], bbox_max[0], bbox_max[1]],
             ground_y,
             debug_flags: (self.show_all_white as u32) | ((params.show_depth as u32) << 1),
             near,
@@ -2077,6 +2148,11 @@ impl GpuRenderer {
                         0.0,
                         precomputed_physical_layers as f32,
                     ],
+                    ambient_light_params,
+                    contact_shadow_params: [0.0, 0.0, 0.0, 0.0],
+                    contact_shadow_march: [0.0, 1.0, 0.0, 0.0],
+                    contact_shadow_screen: [0.0, 0.0, 0.0, 0.0],
+                    contact_shadow_bounds: [0.0, 0.0, 0.0, 0.0],
                     ground_y,
                     debug_flags: (self.show_all_white as u32) | ((params.show_depth as u32) << 1),
                     near,
@@ -2145,6 +2221,77 @@ impl GpuRenderer {
         }
 
         let rt = self.render_target.as_ref().unwrap();
+        let precomputed_receiver_view = match self.precomputed_shadow_state.as_ref() {
+            Some(state) => state.texture.create_view(&wgpu::TextureViewDescriptor {
+                label: Some("precomputed_shadow_receiver_view"),
+                dimension: Some(wgpu::TextureViewDimension::D2Array),
+                array_layer_count: Some(state.key.layers),
+                ..Default::default()
+            }),
+            None => self._precomputed_shadow_fallback_texture.create_view(
+                &wgpu::TextureViewDescriptor {
+                    label: Some("precomputed_shadow_receiver_fallback_view"),
+                    dimension: Some(wgpu::TextureViewDimension::D2Array),
+                    array_layer_count: Some(1),
+                    ..Default::default()
+                },
+            ),
+        };
+        let shadow_receiver_bind_group =
+            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("shadow_receiver_bg"),
+                layout: &self.precomputed_shadow_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&precomputed_receiver_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.precomputed_shadow_sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&rt.contact_depth_view),
+                    },
+                ],
+            });
+        if contact_enabled && n_idx > 0 {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("contact_depth_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &rt.contact_depth_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 1.0,
+                            g: 0.0,
+                            b: 0.0,
+                            a: 0.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &rt.contact_depth_stencil_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Discard,
+                    }),
+                    stencil_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(0),
+                        store: wgpu::StoreOp::Discard,
+                    }),
+                }),
+                ..Default::default()
+            });
+            pass.set_vertex_buffer(0, vb.slice(..));
+            pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint16);
+            pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+            pass.set_pipeline(&self.contact_depth_pipeline);
+            pass.draw_indexed(0..n_idx, 0, 0..1);
+        }
+
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("scene_pass"),
@@ -2206,7 +2353,7 @@ impl GpuRenderer {
                 pass.set_pipeline(&self.pipeline);
                 pass.set_bind_group(1, &tex_bg, &[]);
                 pass.set_bind_group(2, &self.shadow_map_bind_group, &[]);
-                pass.set_bind_group(3, self.precomputed_shadow_bind_group(), &[]);
+                pass.set_bind_group(3, &shadow_receiver_bind_group, &[]);
                 pass.draw_indexed(0..n_idx, 0, 0..1);
 
                 if self.show_wireframe {
@@ -2251,29 +2398,6 @@ impl GpuRenderer {
             }
         }
 
-        let scene_w = rt.scene_width as f32;
-        let scene_h = rt.scene_height as f32;
-        let bbox_padding = params.ssao_bbox_padding.unwrap_or(0.1);
-        let (bbox_min, bbox_max) =
-            screen_aabb_from_mvp(&mvp, billboard_h, bbox_padding, scene_w, scene_h);
-        let p0 = mat4_transform_point(&ground_mvp, [0.0, 0.0, 0.0, 1.0]);
-        let p1 = mat4_transform_point(&ground_mvp, [light_dir[0], light_dir[1], light_dir[2], 1.0]);
-        let ndc0 = [p0[0] / p0[3], p0[1] / p0[3], p0[2] / p0[3]];
-        let ndc1 = [p1[0] / p1[3], p1[1] / p1[3], p1[2] / p1[3]];
-        let delta_ndc = [ndc1[0] - ndc0[0], -(ndc1[1] - ndc0[1]), ndc1[2] - ndc0[2]];
-        let delta_screen = [delta_ndc[0] * scene_w * 0.5, delta_ndc[1] * scene_h * 0.5];
-        let screen_len =
-            (delta_screen[0] * delta_screen[0] + delta_screen[1] * delta_screen[1]).sqrt();
-        let (screen_dir, dz_ndc_per_px) = if screen_len > 0.001 {
-            (
-                [delta_screen[0] / screen_len, delta_screen[1] / screen_len],
-                delta_ndc[2] / screen_len,
-            )
-        } else {
-            ([0.0, 0.0], 0.0)
-        };
-        let ref_height = 720.0f32;
-        let res_scale = scene_h / ref_height;
         let ssao_uniforms = SsaoUniforms {
             strength: params.ssao_strength.unwrap_or(10.0),
             depth_threshold: params.ssao_depth_threshold.unwrap_or(0.0),
@@ -2720,6 +2844,40 @@ impl GpuRenderer {
         let linear_depth_view =
             linear_depth_tex.create_view(&wgpu::TextureViewDescriptor::default());
 
+        let contact_depth_tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("rt_contact_depth"),
+            size: wgpu::Extent3d {
+                width: scene_w,
+                height: scene_h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.linear_depth_format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let contact_depth_view =
+            contact_depth_tex.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let contact_depth_stencil_tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("rt_contact_depth_stencil"),
+            size: wgpu::Extent3d {
+                width: scene_w,
+                height: scene_h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth24PlusStencil8,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let contact_depth_stencil_view =
+            contact_depth_stencil_tex.create_view(&wgpu::TextureViewDescriptor::default());
+
         let depth_tex = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("rt_depth"),
             size: wgpu::Extent3d {
@@ -2849,6 +3007,8 @@ impl GpuRenderer {
             color_texture,
             color_view,
             linear_depth_view,
+            contact_depth_view,
+            contact_depth_stencil_view,
             ssao_output_texture,
             ssao_output_view,
             downsample_output_texture,

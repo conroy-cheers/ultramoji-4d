@@ -486,6 +486,7 @@ impl SliderState {
             supersample: false,
             show_depth: false,
             render_scale: None,
+            ..preview::gpu::SceneParams::default()
         }
     }
 }

@@ -87,6 +87,14 @@ pub fn show_controls_panel(
                             .step_by(0.25)
                             .text("Preview SSAA"),
                     );
+                    ui.add(
+                        Slider::new(&mut render_config.ambient_light_tint, 0.0..=1.0)
+                            .text("Ambient Tint"),
+                    );
+                    ui.add(
+                        Slider::new(&mut render_config.ambient_light_brightness, 0.0..=1.0)
+                            .text("Ambient Brightness"),
+                    );
 
                     ui.separator();
                     ui.heading("Shadow");
@@ -103,6 +111,37 @@ pub fn show_controls_panel(
                         });
                     ui.add(Slider::new(&mut render_config.shadow_strength, 0.0..=1.0).text("Strength"));
                     ui.add(Slider::new(&mut render_config.shadow_max, 0.0..=1.0).text("Max Darkness"));
+                    ui.checkbox(&mut render_config.contact_shadows, "Contact Shadows");
+                    if render_config.shadow_mode == 1 && render_config.contact_shadows {
+                        ui.add(
+                            Slider::new(&mut render_config.contact_shadow_depth_threshold, 0.0..=0.03)
+                                .text("Contact Bias"),
+                        );
+                        ui.add(
+                            Slider::new(&mut render_config.contact_shadow_max_depth_delta, 0.02..=0.60)
+                                .text("Contact Thickness"),
+                        );
+                        ui.add(
+                            Slider::new(&mut render_config.contact_shadow_start_dist, 0.0..=3.0)
+                                .text("Contact Start"),
+                        );
+                        ui.add(
+                            Slider::new(&mut render_config.contact_shadow_step_dist, 0.25..=3.0)
+                                .text("Contact Step"),
+                        );
+                        ui.add(
+                            Slider::new(&mut render_config.contact_shadow_max_dist, 2.0..=32.0)
+                                .text("Contact Length"),
+                        );
+                        ui.add(
+                            Slider::new(&mut render_config.contact_shadow_jitter_spread, 0.0..=0.5)
+                                .text("Contact Jitter"),
+                        );
+                        ui.add(
+                            Slider::new(&mut render_config.contact_shadow_steps, 4..=48)
+                                .text("Contact Steps"),
+                        );
+                    }
                     if render_config.shadow_mode == 2 {
                         ui.add(
                             Slider::new(&mut render_config.precomputed_shadow_bins, 8..=256)

@@ -9,6 +9,11 @@ struct Uniforms {
     camera_pos: vec4f,
     shadow_map_params: vec4f,
     precomputed_shadow_params: vec4f,
+    ambient_light_params: vec4f,
+    contact_shadow_params: vec4f,
+    contact_shadow_march: vec4f,
+    contact_shadow_screen: vec4f,
+    contact_shadow_bounds: vec4f,
     ground_y: f32,
     debug_flags: u32,
     near: f32,
@@ -23,6 +28,7 @@ struct Uniforms {
 @group(2) @binding(1) var shadow_map_sampler: sampler;
 @group(3) @binding(0) var precomputed_shadow_tex: texture_2d_array<f32>;
 @group(3) @binding(1) var precomputed_shadow_sampler: sampler;
+@group(3) @binding(2) var contact_depth_tex: texture_2d<f32>;
 
 struct VertexOutput {
     @builtin(position) position: vec4f,
@@ -62,13 +68,10 @@ fn luminance(c: vec3f) -> f32 {
     return dot(c, vec3f(0.299, 0.587, 0.114));
 }
 
-const AMBIENT_LIGHT_LUMINANCE: f32 = 0.35;
-const AMBIENT_LIGHT_FLOOR_BLEND: f32 = 0.25;
-
-fn ambient_light_color(bg_color: vec3f) -> vec3f {
-    let tint = mix(vec3f(1.0), bg_color, AMBIENT_LIGHT_FLOOR_BLEND);
+fn ambient_light_color(bg_color: vec3f, ambient_light_params: vec4f) -> vec3f {
+    let tint = mix(vec3f(1.0), bg_color, ambient_light_params.y);
     let tint_luma = max(luminance(tint), 0.001);
-    return tint * (AMBIENT_LIGHT_LUMINANCE / tint_luma);
+    return tint * (ambient_light_params.x / tint_luma);
 }
 
 fn perturb_normal(geom_n: vec3f, uv: vec2f, face_type: u32) -> vec3f {
@@ -165,6 +168,77 @@ fn precomputed_shadow_factor(uv: vec2f, face_type: u32) -> f32 {
     return 1.0 - shadow * shadow_amount;
 }
 
+fn camera_linear_depth(d: f32) -> f32 {
+    return u.near * u.far / (u.far - d * (u.far - u.near));
+}
+
+fn contact_shadow_factor(frag_coord: vec4f, direct_facing: f32) -> f32 {
+    let contact_jitter = max(u.contact_shadow_screen.w - 1.0, 0.0);
+    if u.contact_shadow_screen.w < 0.5 || direct_facing <= 0.0 {
+        return 1.0;
+    }
+
+    let base_dir = u.contact_shadow_screen.xy;
+    if dot(base_dir, base_dir) < 0.001 {
+        return 1.0;
+    }
+
+    let dims_i = vec2i(textureDimensions(contact_depth_tex));
+    let dims = vec2f(dims_i);
+    let bounds = u.contact_shadow_bounds;
+    let strength = clamp(u.contact_shadow_params.x * u.contact_shadow_params.y, 0.0, 1.0);
+    if strength <= 0.0 {
+        return 1.0;
+    }
+
+    let raw_depth = frag_coord.z;
+    let dz_ndc_per_px = u.contact_shadow_screen.z;
+    let depth_threshold = u.contact_shadow_params.z;
+    let max_depth_delta = u.contact_shadow_params.w;
+    let step_count = u32(clamp(u.contact_shadow_march.w, 1.0, 128.0));
+    let step_dist = max(u.contact_shadow_march.y, 0.25);
+    let max_trace_dist = max(u.contact_shadow_march.z, u.contact_shadow_march.x + step_dist);
+
+    let ign = fract(52.9829189 * fract(0.06711056 * frag_coord.x + 0.00583715 * frag_coord.y));
+    let perp_dir = vec2f(-base_dir.y, base_dir.x);
+    let march_dir = normalize(base_dir + perp_dir * ((ign - 0.5) * contact_jitter));
+
+    var dist = u.contact_shadow_march.x;
+    for (var i = 0u; i < step_count; i++) {
+        if dist > max_trace_dist {
+            break;
+        }
+        let sample_pos = frag_coord.xy + march_dir * dist;
+        if sample_pos.x < 0.0 || sample_pos.y < 0.0
+            || sample_pos.x >= dims.x || sample_pos.y >= dims.y {
+            break;
+        }
+        if sample_pos.x < bounds.x || sample_pos.y < bounds.y
+            || sample_pos.x > bounds.z || sample_pos.y > bounds.w {
+            dist += step_dist;
+            continue;
+        }
+
+        let sample_px = clamp(vec2i(sample_pos), vec2i(0), dims_i - vec2i(1));
+        let scene_ndc = textureLoad(contact_depth_tex, sample_px, 0).r;
+        if scene_ndc < 0.999 {
+            let ray_ndc = clamp(raw_depth + dz_ndc_per_px * dist, 0.0, 0.999);
+            let ray_lin = camera_linear_depth(ray_ndc);
+            let scene_lin = camera_linear_depth(scene_ndc);
+            let diff = ray_lin - scene_lin;
+            if diff > depth_threshold && diff < max_depth_delta {
+                let distance_fade = 1.0 - smoothstep(max_trace_dist * 0.45, max_trace_dist, dist);
+                let thickness_fade = 1.0 - smoothstep(max_depth_delta * 0.45, max_depth_delta, diff);
+                return 1.0 - strength * distance_fade * thickness_fade;
+            }
+        }
+
+        dist += step_dist;
+    }
+
+    return 1.0;
+}
+
 fn texture_space_alpha_shadow_dir(uv: vec2f, uv_dir: vec2f) -> f32 {
     let tex_dims = vec2i(textureDimensions(tex));
     if dot(uv_dir, uv_dir) < 0.0001 {
@@ -205,17 +279,14 @@ fn fs_main(in: VertexOutput) -> SceneOutput {
     let geom_n = normalize(in.normal);
 
     var base_color: vec4f;
-    var ambient: f32;
     var diff_strength: f32;
 
     let sample = textureSample(tex, tex_sampler, in.uv);
     base_color = vec4f(sample.rgb, 1.0);
 
     if in.face_type <= 1u {
-        ambient = 0.35;
         diff_strength = 0.65;
     } else {
-        ambient = 0.25;
         diff_strength = 0.45;
     }
 
@@ -239,9 +310,14 @@ fn fs_main(in: VertexOutput) -> SceneOutput {
         dark_factor = 0.7;
     }
 
-    let direct_visibility = shadow_map_factor(in.light_position) * precomputed_shadow_factor(in.uv, in.face_type);
-    let ambient_rgb = ambient_light_color(u.bg_color.rgb) * (ambient / AMBIENT_LIGHT_LUMINANCE);
-    let rgb = base_color.rgb * dark_factor * (ambient_rgb + vec3f(diffuse * direct_visibility)) + vec3f(spec * direct_visibility);
+    let direct_visibility = shadow_map_factor(in.light_position)
+        * contact_shadow_factor(in.position, direct_facing)
+        * precomputed_shadow_factor(in.uv, in.face_type);
+    let ambient_rgb = ambient_light_color(u.bg_color.rgb, u.ambient_light_params);
+    let ambient_contribution = base_color.rgb * ambient_rgb;
+    let direct_contribution = base_color.rgb * dark_factor * vec3f(diffuse * direct_visibility)
+        + vec3f(spec * direct_visibility);
+    let rgb = ambient_contribution + direct_contribution;
     var out: SceneOutput;
     out.color = vec4f(clamp(rgb, vec3f(0.0), vec3f(1.0)), base_color.a);
     out.depth = in.position.z;
@@ -250,6 +326,18 @@ fn fs_main(in: VertexOutput) -> SceneOutput {
 
 struct ShadowVertexOutput {
     @builtin(position) position: vec4f,
+}
+
+@vertex
+fn vs_contact_depth(in: VertexInput) -> ShadowVertexOutput {
+    var out: ShadowVertexOutput;
+    out.position = u.mvp * vec4f(in.position, 1.0);
+    return out;
+}
+
+@fragment
+fn fs_contact_depth(in: ShadowVertexOutput) -> @location(0) f32 {
+    return in.position.z;
 }
 
 @vertex
@@ -367,7 +455,7 @@ struct SsaoParams {
 }
 
 fn shadow_map_ambient_color() -> vec3f {
-    return ambient_light_color(ssao_u.bg_color.rgb);
+    return ambient_light_color(ssao_u.bg_color.rgb, ssao_u.ambient_light_params);
 }
 
 @group(0) @binding(0) var<uniform> ssao_u: Uniforms;

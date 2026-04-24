@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     net::SocketAddr,
     path::{Component, Path, PathBuf},
     sync::Arc,
@@ -91,6 +92,7 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/emoji-asset", get(relay_emoji_asset))
+        .route("/asset-manifest.json", get(asset_manifest))
         .fallback(static_asset)
         .with_state(state.clone());
 
@@ -123,6 +125,56 @@ async fn healthz() -> Response {
     headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
     add_security_headers(headers);
     response
+}
+
+async fn asset_manifest(State(state): State<AppState>) -> Response {
+    const ASSETS: &[&str] = &[
+        "slack_hosted.js",
+        "pkg/emoji_web.js",
+        "pkg/emoji_web_bg.wasm",
+    ];
+
+    let mut manifest = BTreeMap::new();
+    for asset in ASSETS {
+        let path = state.static_dir.join(asset);
+        match fs::read(&path).await {
+            Ok(bytes) => {
+                manifest.insert(*asset, format!("{:016x}", stable_content_hash(&bytes)));
+            }
+            Err(err) => {
+                warn!(path = %path.display(), %err, "failed to hash asset manifest entry");
+            }
+        }
+    }
+
+    let body = match serde_json::to_vec(&manifest) {
+        Ok(body) => body,
+        Err(err) => {
+            error!(%err, "failed to encode asset manifest");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to encode manifest",
+            );
+        }
+    };
+    let mut response = Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/json")
+        .header(CONTENT_LENGTH, body.len().to_string())
+        .header(CACHE_CONTROL, HeaderValue::from_static("no-store"))
+        .body(Body::from(body))
+        .expect("valid manifest response");
+    add_security_headers(response.headers_mut());
+    response
+}
+
+fn stable_content_hash(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 async fn relay_emoji_asset(

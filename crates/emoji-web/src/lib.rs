@@ -51,6 +51,8 @@ struct RenderConfig {
     preview_render_scale: f32,
     display_pixelated: bool,
     overlay_filter: bool,
+    ambient_light_tint: f32,
+    ambient_light_brightness: f32,
     shadow_strength: f32,
     shadow_depth_threshold: f32,
     shadow_start_dist: f32,
@@ -61,6 +63,14 @@ struct RenderConfig {
     shadow_bbox_padding: f32,
     shadow_steps: u32,
     shadow_empty_depth_mode: u32,
+    contact_shadows: bool,
+    contact_shadow_depth_threshold: f32,
+    contact_shadow_start_dist: f32,
+    contact_shadow_step_dist: f32,
+    contact_shadow_max_dist: f32,
+    contact_shadow_max_depth_delta: f32,
+    contact_shadow_jitter_spread: f32,
+    contact_shadow_steps: u32,
     shadow_mode: u32,
     precomputed_shadow_bins: u32,
     precomputed_shadow_resolution: u32,
@@ -106,6 +116,8 @@ impl Default for RenderConfig {
             preview_render_scale: 2.0,
             display_pixelated: false,
             overlay_filter: false,
+            ambient_light_tint: 0.67,
+            ambient_light_brightness: 0.11,
             shadow_strength: 1.0,
             shadow_depth_threshold: 0.0,
             shadow_start_dist: 0.1,
@@ -116,6 +128,14 @@ impl Default for RenderConfig {
             shadow_bbox_padding: 0.1,
             shadow_steps: 32,
             shadow_empty_depth_mode: 0,
+            contact_shadows: true,
+            contact_shadow_depth_threshold: 0.003,
+            contact_shadow_start_dist: 0.75,
+            contact_shadow_step_dist: 0.85,
+            contact_shadow_max_dist: 12.0,
+            contact_shadow_max_depth_delta: 0.1,
+            contact_shadow_jitter_spread: 0.08,
+            contact_shadow_steps: 16,
             shadow_mode: 1,
             precomputed_shadow_bins: 96,
             precomputed_shadow_resolution: 256,
@@ -251,10 +271,21 @@ pub fn set_render_config(
 }
 
 #[wasm_bindgen]
+pub fn set_ambient_light_config(ambient_light_tint: f32, ambient_light_brightness: f32) {
+    RENDER_CONFIG.with(|cfg| {
+        let mut current = *cfg.borrow();
+        current.ambient_light_tint = ambient_light_tint.clamp(0.0, 1.0);
+        current.ambient_light_brightness = ambient_light_brightness.clamp(0.0, 1.0);
+        *cfg.borrow_mut() = current;
+    });
+}
+
+#[wasm_bindgen]
 pub fn set_shadow_render_config(
     shadow_mode: u32,
     shadow_strength: f32,
     shadow_max: f32,
+    contact_shadows: bool,
     precomputed_shadow_bins: u32,
     precomputed_shadow_resolution: u32,
 ) {
@@ -263,6 +294,7 @@ pub fn set_shadow_render_config(
         current.shadow_mode = shadow_mode.min(2);
         current.shadow_strength = shadow_strength.clamp(0.0, 1.0);
         current.shadow_max = shadow_max.clamp(0.0, 1.0);
+        current.contact_shadows = contact_shadows;
         current.precomputed_shadow_bins = precomputed_shadow_bins.clamp(8, 256);
         current.precomputed_shadow_resolution = precomputed_shadow_resolution.clamp(32, 1024);
         *cfg.borrow_mut() = current;
@@ -1902,6 +1934,8 @@ impl App {
                     params.supersample = render_config.preview_render_scale > 1.01;
                     params.render_scale = Some(render_config.preview_render_scale);
                     params.rotation = self.preview_manual_rotation;
+                    params.ambient_light_tint = Some(render_config.ambient_light_tint);
+                    params.ambient_light_brightness = Some(render_config.ambient_light_brightness);
                     params.ssao_strength = Some(render_config.shadow_strength);
                     params.ssao_depth_threshold = Some(render_config.shadow_depth_threshold);
                     params.ssao_start_dist = Some(render_config.shadow_start_dist);
@@ -1912,6 +1946,18 @@ impl App {
                     params.ssao_bbox_padding = Some(render_config.shadow_bbox_padding);
                     params.ssao_steps = Some(render_config.shadow_steps);
                     params.ssao_empty_depth_mode = Some(render_config.shadow_empty_depth_mode);
+                    params.contact_shadows = Some(render_config.contact_shadows);
+                    params.contact_shadow_depth_threshold =
+                        Some(render_config.contact_shadow_depth_threshold);
+                    params.contact_shadow_start_dist =
+                        Some(render_config.contact_shadow_start_dist);
+                    params.contact_shadow_step_dist = Some(render_config.contact_shadow_step_dist);
+                    params.contact_shadow_max_dist = Some(render_config.contact_shadow_max_dist);
+                    params.contact_shadow_max_depth_delta =
+                        Some(render_config.contact_shadow_max_depth_delta);
+                    params.contact_shadow_jitter_spread =
+                        Some(render_config.contact_shadow_jitter_spread);
+                    params.contact_shadow_steps = Some(render_config.contact_shadow_steps);
                     params.shadow_mode = Some(render_config.shadow_mode);
                     params.precomputed_shadow_bins = Some(render_config.precomputed_shadow_bins);
                     params.precomputed_shadow_resolution =
