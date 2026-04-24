@@ -83,10 +83,62 @@ pub fn show_controls_panel(
                             .text("Preview Res"),
                     );
                     ui.add(
-                        Slider::new(&mut render_config.preview_render_scale, 1.0..=3.0)
+                        Slider::new(&mut render_config.preview_render_scale, 0.5..=3.0)
                             .step_by(0.25)
                             .text("Preview SSAA"),
                     );
+
+                    ui.separator();
+                    ui.heading("Shadow");
+                    ComboBox::from_label("Pipeline")
+                        .selected_text(match render_config.shadow_mode {
+                            1 => "Shadow Map",
+                            2 => "Precomputed",
+                            _ => "Raymarch",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut render_config.shadow_mode, 0, "Raymarch");
+                            ui.selectable_value(&mut render_config.shadow_mode, 1, "Shadow Map");
+                            ui.selectable_value(&mut render_config.shadow_mode, 2, "Precomputed");
+                        });
+                    ui.add(Slider::new(&mut render_config.shadow_strength, 0.0..=1.0).text("Strength"));
+                    ui.add(Slider::new(&mut render_config.shadow_max, 0.0..=1.0).text("Max Darkness"));
+                    if render_config.shadow_mode == 2 {
+                        ui.add(
+                            Slider::new(&mut render_config.precomputed_shadow_bins, 8..=256)
+                                .step_by(8.0)
+                                .text("Mask Bins"),
+                        );
+                        ui.add(
+                            Slider::new(
+                                &mut render_config.precomputed_shadow_resolution,
+                                32..=1024,
+                            )
+                            .step_by(32.0)
+                            .text("Mask Res"),
+                        );
+                    }
+                    ui.add(Slider::new(&mut render_config.shadow_depth_threshold, -0.02..=0.08).text("Depth Bias"));
+                    ui.add(Slider::new(&mut render_config.shadow_max_depth_delta, 0.01..=2.0).text("Max Depth Gap"));
+                    ui.add(Slider::new(&mut render_config.shadow_start_dist, 0.0..=8.0).text("Start Dist"));
+                    ui.add(Slider::new(&mut render_config.shadow_step_growth, 1.0..=1.8).text("Step Growth"));
+                    ui.add(Slider::new(&mut render_config.shadow_jitter_spread, 0.0..=1.5).text("Jitter"));
+                    ui.add(Slider::new(&mut render_config.shadow_bbox_padding, 0.0..=0.5).text("Bounds Pad"));
+                    ui.add(
+                        Slider::new(&mut render_config.shadow_steps, 1..=128)
+                            .text("Steps"),
+                    );
+                    ComboBox::from_label("Transparent Gaps")
+                        .selected_text(match render_config.shadow_empty_depth_mode {
+                            1 => "Terminate",
+                            2 => "Shadow",
+                            _ => "Skip",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut render_config.shadow_empty_depth_mode, 0, "Skip");
+                            ui.selectable_value(&mut render_config.shadow_empty_depth_mode, 1, "Terminate");
+                            ui.selectable_value(&mut render_config.shadow_empty_depth_mode, 2, "Shadow");
+                        });
 
                     ui.separator();
                     ui.heading("Perf");

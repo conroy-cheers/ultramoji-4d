@@ -72,12 +72,16 @@ fn sample_filtered(
 }
 
 fn sample_billboard_scene(uv: vec2f) -> vec3f {
-    return textureSampleLevel(
+    // The 3D renderer's offscreen target is sampled directly here. Its texture
+    // coordinate origin is opposite the terminal/screen-space billboard rect.
+    let sample_uv = vec2f(uv.x, 1.0 - uv.y);
+    let color = textureSampleLevel(
         billboard_tex,
         billboard_sampler,
-        clamp(uv, vec2f(0.0), vec2f(1.0)),
+        clamp(sample_uv, vec2f(0.0), vec2f(1.0)),
         0.0,
     ).rgb;
+    return apply_transfer_tuning(color);
 }
 
 fn hash12(p: vec2f) -> f32 {

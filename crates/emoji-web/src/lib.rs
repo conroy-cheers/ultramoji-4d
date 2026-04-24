@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
 
 use egui_wgpu::{Renderer as EguiRenderer, ScreenDescriptor};
 use emoji_renderer::decode::decode_emoji_frames;
@@ -19,10 +20,6 @@ mod terminal_renderer;
 use terminal_renderer::{TERM_COLS, TERM_ROWS, TerminalGrid, TerminalRenderer};
 
 const COMPOSITE_SHADER: &str = include_str!("composite.wgsl");
-const BLIT_SHADER: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../emoji-renderer/src/present_blit.wgsl"
-));
 
 #[derive(Clone, Copy, PartialEq)]
 struct TransferTuning {
@@ -48,14 +45,33 @@ struct RenderConfig {
     preview_render_scale: f32,
     display_pixelated: bool,
     overlay_filter: bool,
+    shadow_strength: f32,
+    shadow_depth_threshold: f32,
+    shadow_start_dist: f32,
+    shadow_step_growth: f32,
+    shadow_max: f32,
+    shadow_jitter_spread: f32,
+    shadow_max_depth_delta: f32,
+    shadow_bbox_padding: f32,
+    shadow_steps: u32,
+    shadow_empty_depth_mode: u32,
+    shadow_mode: u32,
+    precomputed_shadow_bins: u32,
+    precomputed_shadow_resolution: u32,
 }
 
+#[derive(Clone)]
 struct DecodedPreviewAsset {
     name: String,
     frames: Vec<Vec<[u8; 4]>>,
     delays_ms: Vec<u32>,
     width: u32,
     height: u32,
+}
+
+struct PendingRouteState {
+    search: String,
+    preview_name: String,
 }
 
 enum PendingPreviewAsset {
@@ -84,6 +100,19 @@ impl Default for RenderConfig {
             preview_render_scale: 2.0,
             display_pixelated: false,
             overlay_filter: false,
+            shadow_strength: 1.0,
+            shadow_depth_threshold: 0.0,
+            shadow_start_dist: 0.1,
+            shadow_step_growth: 1.20,
+            shadow_max: 1.0,
+            shadow_jitter_spread: 0.35,
+            shadow_max_depth_delta: 0.5,
+            shadow_bbox_padding: 0.1,
+            shadow_steps: 32,
+            shadow_empty_depth_mode: 0,
+            shadow_mode: 1,
+            precomputed_shadow_bins: 96,
+            precomputed_shadow_resolution: 256,
         }
     }
 }
@@ -105,11 +134,62 @@ thread_local! {
     static RENDER_CONFIG: RefCell<RenderConfig> = RefCell::new(RenderConfig::default());
     static PENDING_GALLERY_ENTRIES: RefCell<Option<Vec<String>>> = RefCell::new(None);
     static PENDING_PREVIEW_ASSET: RefCell<Option<PendingPreviewAsset>> = RefCell::new(None);
+    static DECODED_PREVIEW_CACHE: RefCell<DecodedPreviewCache> = RefCell::new(DecodedPreviewCache::new(12));
+    static PENDING_ROUTE_STATE: RefCell<Option<PendingRouteState>> = RefCell::new(None);
     static CURRENT_EMOJI_NAME: RefCell<String> = RefCell::new(String::new());
+    static CURRENT_PREVIEW_EMOJI_NAME: RefCell<String> = RefCell::new(String::new());
+    static CURRENT_PREVIEW_NEIGHBORS: RefCell<(String, String)> = RefCell::new((String::new(), String::new()));
+    static CURRENT_SEARCH_QUERY: RefCell<String> = RefCell::new(String::new());
     static PENDING_HOSTED_AUTH_STATE: RefCell<Option<gallery::HostedAuthState>> = RefCell::new(None);
     static LOGIN_REQUEST_NONCE: RefCell<u32> = const { RefCell::new(0) };
     static PENDING_SETTINGS_TOGGLE: RefCell<bool> = const { RefCell::new(false) };
     static SIGN_OUT_REQUEST_NONCE: RefCell<u32> = const { RefCell::new(0) };
+}
+
+struct DecodedPreviewCache {
+    capacity: usize,
+    entries: HashMap<String, DecodedPreviewAsset>,
+    order: VecDeque<String>,
+}
+
+impl DecodedPreviewCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn get(&mut self, name: &str) -> Option<DecodedPreviewAsset> {
+        let asset = self.entries.get(name)?.clone();
+        self.touch(name);
+        Some(asset)
+    }
+
+    fn insert(&mut self, asset: DecodedPreviewAsset) {
+        let name = asset.name.clone();
+        self.entries.insert(name.clone(), asset);
+        self.touch(&name);
+        while self.entries.len() > self.capacity {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if self.order.iter().any(|name| name == &oldest) {
+                continue;
+            }
+            self.entries.remove(&oldest);
+        }
+    }
+
+    fn touch(&mut self, name: &str) {
+        self.order.push_back(name.to_owned());
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.order.clear();
+    }
 }
 
 #[wasm_bindgen]
@@ -151,14 +231,35 @@ pub fn set_render_config(
     overlay_filter_enabled: bool,
 ) {
     RENDER_CONFIG.with(|cfg| {
+        let current = *cfg.borrow();
         *cfg.borrow_mut() = RenderConfig {
             gallery_canvas_scale: gallery_canvas_scale.clamp(0.25, 2.0),
             preview_canvas_scale: preview_canvas_scale.clamp(0.25, 2.0),
             preview_max_dim: preview_max_dim.max(1),
-            preview_render_scale: preview_render_scale.clamp(1.0, 4.0),
+            preview_render_scale: preview_render_scale.clamp(0.5, 4.0),
             display_pixelated,
             overlay_filter: overlay_filter_enabled,
+            ..current
         };
+    });
+}
+
+#[wasm_bindgen]
+pub fn set_shadow_render_config(
+    shadow_mode: u32,
+    shadow_strength: f32,
+    shadow_max: f32,
+    precomputed_shadow_bins: u32,
+    precomputed_shadow_resolution: u32,
+) {
+    RENDER_CONFIG.with(|cfg| {
+        let mut current = *cfg.borrow();
+        current.shadow_mode = shadow_mode.min(2);
+        current.shadow_strength = shadow_strength.clamp(0.0, 1.0);
+        current.shadow_max = shadow_max.clamp(0.0, 1.0);
+        current.precomputed_shadow_bins = precomputed_shadow_bins.clamp(8, 256);
+        current.precomputed_shadow_resolution = precomputed_shadow_resolution.clamp(32, 1024);
+        *cfg.borrow_mut() = current;
     });
 }
 
@@ -183,6 +284,11 @@ pub fn clear_active_emoji_texture() {
 }
 
 #[wasm_bindgen]
+pub fn clear_decoded_emoji_texture_cache() {
+    DECODED_PREVIEW_CACHE.with(|cache| cache.borrow_mut().clear());
+}
+
+#[wasm_bindgen]
 pub fn set_active_emoji_texture_error(name: String) {
     PENDING_PREVIEW_ASSET.with(|pending| {
         *pending.borrow_mut() = Some(PendingPreviewAsset::Error(name));
@@ -191,24 +297,85 @@ pub fn set_active_emoji_texture_error(name: String) {
 
 #[wasm_bindgen]
 pub fn set_active_emoji_texture_bytes(name: String, bytes: Vec<u8>) -> bool {
-    let Some((frames, delays_ms, width, height)) = decode_emoji_frames(&bytes) else {
+    let Some(asset) = decode_preview_asset(name, &bytes) else {
         return false;
     };
+    DECODED_PREVIEW_CACHE.with(|cache| {
+        cache.borrow_mut().insert(asset.clone());
+    });
     PENDING_PREVIEW_ASSET.with(|pending| {
-        *pending.borrow_mut() = Some(PendingPreviewAsset::Replace(DecodedPreviewAsset {
-            name,
-            frames,
-            delays_ms,
-            width,
-            height,
-        }));
+        *pending.borrow_mut() = Some(PendingPreviewAsset::Replace(asset));
     });
     true
 }
 
 #[wasm_bindgen]
+pub fn preload_emoji_texture_bytes(name: String, bytes: Vec<u8>) -> bool {
+    let Some(asset) = decode_preview_asset(name, &bytes) else {
+        return false;
+    };
+    DECODED_PREVIEW_CACHE.with(|cache| {
+        cache.borrow_mut().insert(asset);
+    });
+    true
+}
+
+#[wasm_bindgen]
+pub fn set_active_emoji_texture_from_cache(name: String) -> bool {
+    let asset = DECODED_PREVIEW_CACHE.with(|cache| cache.borrow_mut().get(&name));
+    let Some(asset) = asset else {
+        return false;
+    };
+    PENDING_PREVIEW_ASSET.with(|pending| {
+        *pending.borrow_mut() = Some(PendingPreviewAsset::Replace(asset));
+    });
+    true
+}
+
+fn decode_preview_asset(name: String, bytes: &[u8]) -> Option<DecodedPreviewAsset> {
+    let (frames, delays_ms, width, height) = decode_emoji_frames(bytes)?;
+    Some(DecodedPreviewAsset {
+        name,
+        frames,
+        delays_ms,
+        width,
+        height,
+    })
+}
+
+#[wasm_bindgen]
 pub fn current_emoji_name() -> String {
     CURRENT_EMOJI_NAME.with(|name| name.borrow().clone())
+}
+
+#[wasm_bindgen]
+pub fn current_preview_emoji_name() -> String {
+    CURRENT_PREVIEW_EMOJI_NAME.with(|name| name.borrow().clone())
+}
+
+#[wasm_bindgen]
+pub fn current_search_query() -> String {
+    CURRENT_SEARCH_QUERY.with(|query| query.borrow().clone())
+}
+
+#[wasm_bindgen]
+pub fn previous_preview_emoji_name() -> String {
+    CURRENT_PREVIEW_NEIGHBORS.with(|neighbors| neighbors.borrow().0.clone())
+}
+
+#[wasm_bindgen]
+pub fn next_preview_emoji_name() -> String {
+    CURRENT_PREVIEW_NEIGHBORS.with(|neighbors| neighbors.borrow().1.clone())
+}
+
+#[wasm_bindgen]
+pub fn set_route_state(search: String, preview_name: String) {
+    PENDING_ROUTE_STATE.with(|pending| {
+        *pending.borrow_mut() = Some(PendingRouteState {
+            search,
+            preview_name,
+        });
+    });
 }
 
 #[wasm_bindgen]
@@ -277,6 +444,27 @@ fn required_limits_for_adapter(adapter: &wgpu::Adapter) -> wgpu::Limits {
     base_limits
         .using_resolution(adapter_limits.clone())
         .using_alignment(adapter_limits)
+}
+
+async fn request_surface_adapter(
+    canvas: &HtmlCanvasElement,
+    backends: wgpu::Backends,
+    power_preference: wgpu::PowerPreference,
+) -> anyhow::Result<Option<(wgpu::Surface<'static>, wgpu::Adapter)>> {
+    let instance_desc = wgpu::InstanceDescriptor {
+        backends,
+        ..Default::default()
+    };
+    let instance = wgpu::util::new_instance_with_webgpu_detection(&instance_desc).await;
+    let surface = instance.create_surface(wgpu::SurfaceTarget::Canvas(canvas.clone()))?;
+    let adapter = instance
+        .request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference,
+            force_fallback_adapter: false,
+            compatible_surface: Some(&surface),
+        })
+        .await;
+    Ok(adapter.map(|adapter| (surface, adapter)))
 }
 
 fn show_startup_error(message: &str) {
@@ -349,12 +537,17 @@ async fn run() {
                 let action = match event.key().as_str() {
                     "ArrowUp" => Some(gallery::KeyAction::Up),
                     "ArrowDown" => Some(gallery::KeyAction::Down),
+                    "ArrowLeft" => Some(gallery::KeyAction::Left),
+                    "ArrowRight" => Some(gallery::KeyAction::Right),
                     "PageUp" => Some(gallery::KeyAction::PageUp),
                     "PageDown" => Some(gallery::KeyAction::PageDown),
                     "F2" => Some(gallery::KeyAction::F2),
                     "F8" => Some(gallery::KeyAction::F8),
                     "Enter" => Some(gallery::KeyAction::Enter),
                     "Escape" => Some(gallery::KeyAction::Escape),
+                    "Backspace" if event.ctrl_key() || event.alt_key() => {
+                        Some(gallery::KeyAction::BackspaceWord)
+                    }
                     "Backspace" => Some(gallery::KeyAction::Backspace),
                     key if key.len() == 1 => {
                         let ch = key.chars().next().unwrap();
@@ -500,15 +693,6 @@ struct App {
     composite_display_pixelated: bool,
     composite_billboard_generation: u64,
     composite_uniform_buffer: wgpu::Buffer,
-    blit_pipeline_opaque: wgpu::RenderPipeline,
-    blit_bind_group_layout: wgpu::BindGroupLayout,
-    billboard_blit_uniform_buffer: wgpu::Buffer,
-    billboard_effect_bind_group: wgpu::BindGroup,
-    billboard_effect_texture: wgpu::Texture,
-    billboard_effect_view: wgpu::TextureView,
-    billboard_effect_width: u32,
-    billboard_effect_height: u32,
-    billboard_effect_generation: u64,
     overlay_sampler_linear: wgpu::Sampler,
     overlay_sampler_nearest: wgpu::Sampler,
     start_time: f64,
@@ -532,10 +716,15 @@ struct App {
     egui_ctx: egui::Context,
     egui_renderer: EguiRenderer,
     egui_pointer_pos: Option<egui::Pos2>,
+    egui_pointer_moved: bool,
     egui_pointer_down: bool,
     egui_pointer_pressed: bool,
     egui_pointer_released: bool,
     egui_scroll_delta: egui::Vec2,
+    egui_cached_paint_jobs: Vec<egui::ClippedPrimitive>,
+    egui_buffers_dirty: bool,
+    egui_last_screen_size: [u32; 2],
+    egui_last_pixels_per_point: f32,
     last_time_secs: f64,
     smoothed_fps: f32,
     last_fps_label: u32,
@@ -574,18 +763,6 @@ struct CompositeUniforms {
     channel_switch: [f32; 4],
 }
 
-#[repr(C)]
-#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-struct BlitUniforms {
-    output_size: [f32; 2],
-    opacity: f32,
-    apply_transfer: f32,
-    dest_rect: [f32; 4],
-    uv_rect: [f32; 4],
-    transfer_tuning: [f32; 4],
-    extra_params: [f32; 4],
-}
-
 impl App {
     fn apply_pending_runtime_updates(&mut self) {
         let mut gallery_updated = false;
@@ -599,6 +776,16 @@ impl App {
             if let Some(entries) = pending.borrow_mut().take() {
                 self.gallery.set_entries(entries);
                 gallery_updated = true;
+            }
+        });
+        PENDING_ROUTE_STATE.with(|pending| {
+            if let Some(route) = pending.borrow_mut().take() {
+                if self
+                    .gallery
+                    .apply_route_state(route.search, route.preview_name)
+                {
+                    gallery_updated = true;
+                }
             }
         });
         if gallery_updated {
@@ -713,6 +900,28 @@ impl App {
         CURRENT_EMOJI_NAME.with(|name| {
             *name.borrow_mut() = current_name.unwrap_or_default();
         });
+        CURRENT_PREVIEW_EMOJI_NAME.with(|name| {
+            *name.borrow_mut() = self
+                .gallery
+                .preview_entry_name()
+                .map(str::to_owned)
+                .unwrap_or_default();
+        });
+        CURRENT_PREVIEW_NEIGHBORS.with(|neighbors| {
+            *neighbors.borrow_mut() = (
+                self.gallery
+                    .previous_preview_entry_name()
+                    .map(str::to_owned)
+                    .unwrap_or_default(),
+                self.gallery
+                    .next_preview_entry_name()
+                    .map(str::to_owned)
+                    .unwrap_or_default(),
+            );
+        });
+        CURRENT_SEARCH_QUERY.with(|query| {
+            *query.borrow_mut() = self.gallery.search_query().to_owned();
+        });
         LOGIN_REQUEST_NONCE.with(|nonce| {
             *nonce.borrow_mut() = self.gallery.login_request_nonce();
         });
@@ -729,23 +938,23 @@ impl App {
             return Some(0);
         }
 
-        let durations: Vec<u64> = self
+        let total_duration_ms: u64 = self
             .preview_frame_delays_ms
             .iter()
             .copied()
             .map(|delay| delay.max(16) as u64)
-            .collect();
-        let total_duration_ms: u64 = durations.iter().sum();
+            .sum();
         if total_duration_ms == 0 {
             return Some(0);
         }
 
         let mut elapsed_ms = ((scene_time_secs * 1000.0).max(0.0)) as u64 % total_duration_ms;
-        for (index, duration_ms) in durations.iter().enumerate() {
-            if elapsed_ms < *duration_ms {
+        for (index, delay_ms) in self.preview_frame_delays_ms.iter().copied().enumerate() {
+            let duration_ms = delay_ms.max(16) as u64;
+            if elapsed_ms < duration_ms {
                 return Some(index);
             }
-            elapsed_ms = elapsed_ms.saturating_sub(*duration_ms);
+            elapsed_ms = elapsed_ms.saturating_sub(duration_ms);
         }
         Some(self.preview_frames.len().saturating_sub(1))
     }
@@ -760,23 +969,22 @@ impl App {
             .unwrap();
         let render_config = RENDER_CONFIG.with(|cfg| *cfg.borrow());
 
-        let instance_desc = wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::BROWSER_WEBGPU | wgpu::Backends::GL,
-            ..Default::default()
+        let (surface, adapter) = if let Some(pair) = request_surface_adapter(
+            &canvas,
+            wgpu::Backends::BROWSER_WEBGPU,
+            wgpu::PowerPreference::HighPerformance,
+        )
+        .await?
+        {
+            pair
+        } else if let Some(pair) =
+            request_surface_adapter(&canvas, wgpu::Backends::GL, wgpu::PowerPreference::LowPower)
+                .await?
+        {
+            pair
+        } else {
+            return Err(anyhow::anyhow!("no WebGPU or WebGL2 adapter"));
         };
-        let instance = wgpu::util::new_instance_with_webgpu_detection(&instance_desc).await;
-
-        let surface_target = wgpu::SurfaceTarget::Canvas(canvas.clone());
-        let surface = instance.create_surface(surface_target)?;
-
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::LowPower,
-                force_fallback_adapter: false,
-                compatible_surface: Some(&surface),
-            })
-            .await
-            .ok_or_else(|| anyhow::anyhow!("no WebGPU or WebGL2 adapter"))?;
 
         let adapter_info = adapter.get_info();
         let downlevel_caps = adapter.get_downlevel_capabilities();
@@ -995,76 +1203,6 @@ impl App {
                     cache: None,
                 });
 
-        let blit_shader = renderer
-            .device()
-            .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("emoji_web_blit_shader"),
-                source: wgpu::ShaderSource::Wgsl(BLIT_SHADER.into()),
-            });
-        let blit_bind_group_layout =
-            renderer
-                .device()
-                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: Some("blit_bgl"),
-                    entries: &[
-                        bgl_texture(0),
-                        bgl_sampler(1),
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 2,
-                            visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Uniform,
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
-                    ],
-                });
-        let billboard_blit_uniform_buffer =
-            renderer.device().create_buffer(&wgpu::BufferDescriptor {
-                label: Some("billboard_blit_uniforms"),
-                size: std::mem::size_of::<BlitUniforms>() as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-        let blit_pipeline_layout =
-            renderer
-                .device()
-                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("blit_pipeline_layout"),
-                    bind_group_layouts: &[&blit_bind_group_layout],
-                    push_constant_ranges: &[],
-                });
-        let blit_pipeline_opaque =
-            renderer
-                .device()
-                .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                    label: Some("blit_pipeline_opaque"),
-                    layout: Some(&blit_pipeline_layout),
-                    vertex: wgpu::VertexState {
-                        module: &blit_shader,
-                        entry_point: Some("vs_main"),
-                        buffers: &[],
-                        compilation_options: Default::default(),
-                    },
-                    fragment: Some(wgpu::FragmentState {
-                        module: &blit_shader,
-                        entry_point: Some("fs_main"),
-                        targets: &[Some(wgpu::ColorTargetState {
-                            format: wgpu::TextureFormat::Rgba8Unorm,
-                            blend: Some(wgpu::BlendState::REPLACE),
-                            write_mask: wgpu::ColorWrites::ALL,
-                        })],
-                        compilation_options: Default::default(),
-                    }),
-                    primitive: wgpu::PrimitiveState::default(),
-                    depth_stencil: None,
-                    multisample: wgpu::MultisampleState::default(),
-                    multiview: None,
-                    cache: None,
-                });
-
         let overlay_sampler_linear = renderer.device().create_sampler(&wgpu::SamplerDescriptor {
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
@@ -1100,8 +1238,6 @@ impl App {
         let terminal_grid = TerminalGrid::new();
         let (_placeholder_billboard_tex, placeholder_billboard_view) =
             create_rgba_texture(renderer.device(), 1, 1);
-        let (billboard_effect_texture, billboard_effect_view) =
-            create_render_target_texture(renderer.device(), 1, 1, "billboard_effect_texture");
         let (screen_texture, screen_texture_view) = create_render_target_texture(
             renderer.device(),
             terminal_renderer.pixel_width(),
@@ -1159,34 +1295,13 @@ impl App {
                         },
                         wgpu::BindGroupEntry {
                             binding: 3,
-                            resource: wgpu::BindingResource::TextureView(&billboard_effect_view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 4,
-                            resource: wgpu::BindingResource::Sampler(&billboard_sampler_linear),
-                        },
-                    ],
-                });
-        let billboard_effect_bind_group =
-            renderer
-                .device()
-                .create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("billboard_effect_bg"),
-                    layout: &blit_bind_group_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
                             resource: wgpu::BindingResource::TextureView(
                                 &placeholder_billboard_view,
                             ),
                         },
                         wgpu::BindGroupEntry {
-                            binding: 1,
+                            binding: 4,
                             resource: wgpu::BindingResource::Sampler(&billboard_sampler_linear),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: billboard_blit_uniform_buffer.as_entire_binding(),
                         },
                     ],
                 });
@@ -1218,15 +1333,6 @@ impl App {
             composite_display_pixelated: false,
             composite_billboard_generation: 0,
             composite_uniform_buffer,
-            blit_pipeline_opaque,
-            blit_bind_group_layout,
-            billboard_blit_uniform_buffer,
-            billboard_effect_bind_group,
-            billboard_effect_texture,
-            billboard_effect_view,
-            billboard_effect_width: 1,
-            billboard_effect_height: 1,
-            billboard_effect_generation: 0,
             overlay_sampler_linear,
             overlay_sampler_nearest,
             start_time,
@@ -1250,10 +1356,15 @@ impl App {
             egui_ctx,
             egui_renderer,
             egui_pointer_pos: None,
+            egui_pointer_moved: false,
             egui_pointer_down: false,
             egui_pointer_pressed: false,
             egui_pointer_released: false,
             egui_scroll_delta: egui::Vec2::ZERO,
+            egui_cached_paint_jobs: Vec::new(),
+            egui_buffers_dirty: false,
+            egui_last_screen_size: [0, 0],
+            egui_last_pixels_per_point: 0.0,
             last_time_secs: 0.0,
             smoothed_fps: 60.0,
             last_fps_label: 60,
@@ -1282,6 +1393,8 @@ impl App {
         let action_name = match &action {
             gallery::KeyAction::Up => "Up",
             gallery::KeyAction::Down => "Down",
+            gallery::KeyAction::Left => "Left",
+            gallery::KeyAction::Right => "Right",
             gallery::KeyAction::PageUp => "PageUp",
             gallery::KeyAction::PageDown => "PageDown",
             gallery::KeyAction::F2 => "F2",
@@ -1290,6 +1403,7 @@ impl App {
             gallery::KeyAction::Escape => "Escape",
             gallery::KeyAction::Char(_) => "Char",
             gallery::KeyAction::Backspace => "Backspace",
+            gallery::KeyAction::BackspaceWord => "BackspaceWord",
         };
         if matches!(action, gallery::KeyAction::F8) {
             self.settings_visible = !self.settings_visible;
@@ -1297,6 +1411,9 @@ impl App {
             self.egui_pointer_released = false;
             self.egui_pointer_down = false;
             self.egui_scroll_delta = egui::Vec2::ZERO;
+            self.egui_pointer_moved = true;
+            self.egui_cached_paint_jobs.clear();
+            self.egui_buffers_dirty = true;
             self.terminal_dirty = true;
             self.screen_dirty = true;
             return;
@@ -1321,21 +1438,28 @@ impl App {
     }
 
     fn handle_mouse_move(&mut self, event: MouseEvent) {
-        self.egui_pointer_pos = Some(egui::pos2(event.offset_x() as f32, event.offset_y() as f32));
+        let pos = egui::pos2(event.offset_x() as f32, event.offset_y() as f32);
+        if self.egui_pointer_pos != Some(pos) {
+            self.egui_pointer_pos = Some(pos);
+            self.egui_pointer_moved = true;
+        }
     }
 
     fn handle_mouse_leave(&mut self) {
         self.egui_pointer_pos = None;
+        self.egui_pointer_moved = true;
     }
 
     fn handle_mouse_down(&mut self, event: MouseEvent) {
         self.egui_pointer_pos = Some(egui::pos2(event.offset_x() as f32, event.offset_y() as f32));
+        self.egui_pointer_moved = true;
         self.egui_pointer_down = true;
         self.egui_pointer_pressed = true;
     }
 
     fn handle_mouse_up(&mut self, event: MouseEvent) {
         self.egui_pointer_pos = Some(egui::pos2(event.offset_x() as f32, event.offset_y() as f32));
+        self.egui_pointer_moved = true;
         self.egui_pointer_down = false;
         self.egui_pointer_released = true;
     }
@@ -1374,7 +1498,12 @@ impl App {
         let mut render_config = RENDER_CONFIG.with(|cfg| *cfg.borrow());
         let mut egui_events = Vec::new();
         if self.settings_visible {
-            if let Some(pos) = self.egui_pointer_pos {
+            if self.egui_pointer_moved {
+                if let Some(pos) = self.egui_pointer_pos {
+                    egui_events.push(egui::Event::PointerMoved(pos));
+                }
+            } else if self.egui_pointer_pressed || self.egui_pointer_released {
+                let pos = self.egui_pointer_pos.unwrap_or(egui::Pos2::ZERO);
                 egui_events.push(egui::Event::PointerMoved(pos));
             }
             if self.egui_pointer_pressed {
@@ -1401,6 +1530,7 @@ impl App {
                 });
             }
         }
+        let egui_input_dirty = !egui_events.is_empty() || self.egui_pointer_down;
         let egui_raw_input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
@@ -1411,62 +1541,85 @@ impl App {
             events: egui_events,
             ..Default::default()
         };
-        let egui_start = perf.now();
-        let full_perf = egui_panel::PerfPanelData {
-            smoothed_fps: self.smoothed_fps,
-            smoothed_frame_cpu_ms: self.smoothed_frame_cpu_ms,
-            smoothed_frame_interval_ms: self.smoothed_frame_interval_ms,
-            smoothed_surface_acquire_ms: self.smoothed_surface_acquire_ms,
-            smoothed_terminal_ms: self.smoothed_terminal_ms,
-            smoothed_screen_ms: self.smoothed_screen_ms,
-            smoothed_scene_ms: self.smoothed_scene_ms,
-            smoothed_egui_ms: self.smoothed_egui_ms,
-            smoothed_composite_ms: self.smoothed_composite_ms,
-            window_width: client_w,
-            window_height: client_h,
-            surface_width: self.config.width,
-            surface_height: self.config.height,
-            terminal_width: self.terminal_renderer.pixel_width(),
-            terminal_height: self.terminal_renderer.pixel_height(),
-            scale_factor: effective_dpr as f32,
-            preview_mix: self.gallery.preview_mix(),
-            egui_paint_jobs: self.egui_paint_jobs,
-            egui_textures_delta: self.egui_textures_delta,
-            last_screen_redrew: self.screen_dirty,
-            last_previewing: self.gallery.is_previewing(),
-            last_uses_billboard: self.gallery.is_previewing() && self.gallery.preview_mix() > 0.0,
-            offscreen_stats: self.renderer.offscreen_perf_stats(),
-        };
         let mut panel_actions = egui_panel::PanelActions::default();
-        let panel_response = self.egui_ctx.run(egui_raw_input, |ctx| {
-            if self.settings_visible {
+        let mut egui_shapes = None;
+        let mut egui_texture_free_ids = Vec::new();
+        let egui_start = perf.now();
+        let egui_periodic_refresh = self.frame_counter % 15 == 0;
+        let run_egui = self.settings_visible
+            && (self.egui_cached_paint_jobs.is_empty()
+                || self.egui_buffers_dirty
+                || egui_input_dirty
+                || egui_periodic_refresh);
+        if run_egui {
+            let full_perf = egui_panel::PerfPanelData {
+                smoothed_fps: self.smoothed_fps,
+                smoothed_frame_cpu_ms: self.smoothed_frame_cpu_ms,
+                smoothed_frame_interval_ms: self.smoothed_frame_interval_ms,
+                smoothed_surface_acquire_ms: self.smoothed_surface_acquire_ms,
+                smoothed_terminal_ms: self.smoothed_terminal_ms,
+                smoothed_screen_ms: self.smoothed_screen_ms,
+                smoothed_scene_ms: self.smoothed_scene_ms,
+                smoothed_egui_ms: self.smoothed_egui_ms,
+                smoothed_composite_ms: self.smoothed_composite_ms,
+                window_width: client_w,
+                window_height: client_h,
+                surface_width: self.config.width,
+                surface_height: self.config.height,
+                terminal_width: self.terminal_renderer.pixel_width(),
+                terminal_height: self.terminal_renderer.pixel_height(),
+                scale_factor: effective_dpr as f32,
+                preview_mix: self.gallery.preview_mix(),
+                egui_paint_jobs: self.egui_paint_jobs,
+                egui_textures_delta: self.egui_textures_delta,
+                last_screen_redrew: self.screen_dirty,
+                last_previewing: self.gallery.is_previewing(),
+                last_uses_billboard: self.gallery.is_previewing()
+                    && self.gallery.preview_mix() > 0.0,
+                offscreen_stats: self.renderer.offscreen_perf_stats(),
+            };
+            let panel_response = self.egui_ctx.run(egui_raw_input, |ctx| {
                 panel_actions = egui_panel::show_controls_panel(
                     ctx,
                     &mut transfer,
                     &mut render_config,
                     full_perf,
                 );
+            });
+            let textures_delta_set_count = panel_response.textures_delta.set.len();
+            let textures_delta_free_count = panel_response.textures_delta.free.len();
+            for (id, delta) in &panel_response.textures_delta.set {
+                self.egui_renderer.update_texture(
+                    self.renderer.device(),
+                    self.renderer.queue(),
+                    *id,
+                    delta,
+                );
             }
-        });
+            self.egui_textures_delta =
+                (textures_delta_set_count + textures_delta_free_count) as u32;
+            egui_texture_free_ids = panel_response.textures_delta.free;
+            egui_shapes = Some(panel_response.shapes);
+            self.smoothed_egui_ms =
+                self.smoothed_egui_ms * 0.85 + ((perf.now() - egui_start) as f32) * 0.15;
+        } else if !self.settings_visible {
+            self.egui_paint_jobs = 0;
+            self.egui_textures_delta = 0;
+            self.egui_cached_paint_jobs.clear();
+            self.egui_buffers_dirty = false;
+            self.smoothed_egui_ms *= 0.85;
+        } else {
+            self.egui_textures_delta = 0;
+            self.smoothed_egui_ms *= 0.85;
+        }
         if panel_actions.sign_out_requested {
             self.sign_out_request_nonce = self.sign_out_request_nonce.wrapping_add(1);
-        }
-        self.smoothed_egui_ms =
-            self.smoothed_egui_ms * 0.85 + ((perf.now() - egui_start) as f32) * 0.15;
-        let textures_delta_set_count = panel_response.textures_delta.set.len();
-        let textures_delta_free_count = panel_response.textures_delta.free.len();
-        for (id, delta) in &panel_response.textures_delta.set {
-            self.egui_renderer.update_texture(
-                self.renderer.device(),
-                self.renderer.queue(),
-                *id,
-                delta,
-            );
         }
         TRANSFER_TUNING.with(|t| *t.borrow_mut() = transfer);
         RENDER_CONFIG.with(|cfg| *cfg.borrow_mut() = render_config);
         self.egui_pointer_pressed = false;
         self.egui_pointer_released = false;
+        self.egui_pointer_moved = false;
         self.egui_scroll_delta = egui::Vec2::ZERO;
         let active_canvas_scale = if self.gallery.is_previewing() {
             render_config.preview_canvas_scale
@@ -1490,11 +1643,28 @@ impl App {
             size_in_pixels: [self.config.width, self.config.height],
             pixels_per_point: effective_dpr as f32,
         };
-        let paint_jobs = self
-            .egui_ctx
-            .tessellate(panel_response.shapes, screen_descriptor.pixels_per_point);
-        self.egui_paint_jobs = paint_jobs.len() as u32;
-        self.egui_textures_delta = (textures_delta_set_count + textures_delta_free_count) as u32;
+        if self.settings_visible {
+            let egui_screen_changed = self.egui_last_screen_size
+                != screen_descriptor.size_in_pixels
+                || (self.egui_last_pixels_per_point - screen_descriptor.pixels_per_point).abs()
+                    > f32::EPSILON;
+            if let Some(shapes) = egui_shapes {
+                self.egui_cached_paint_jobs = self
+                    .egui_ctx
+                    .tessellate(shapes, screen_descriptor.pixels_per_point);
+                self.egui_buffers_dirty = true;
+                self.egui_last_screen_size = screen_descriptor.size_in_pixels;
+                self.egui_last_pixels_per_point = screen_descriptor.pixels_per_point;
+            } else if egui_screen_changed {
+                self.egui_cached_paint_jobs.clear();
+                self.egui_buffers_dirty = true;
+                self.egui_last_screen_size = screen_descriptor.size_in_pixels;
+                self.egui_last_pixels_per_point = screen_descriptor.pixels_per_point;
+            }
+            self.egui_paint_jobs = self.egui_cached_paint_jobs.len() as u32;
+        } else {
+            self.egui_paint_jobs = 0;
+        }
 
         let blink_on = gallery::cursor_blink_on(time_secs);
         let preview_overlay_visible = gallery::show_preview_overlay(&self.gallery);
@@ -1548,6 +1718,12 @@ impl App {
 
         let overlay_w = self.terminal_renderer.pixel_width();
         let overlay_h = self.terminal_renderer.pixel_height();
+        let mut frame_encoder =
+            self.renderer
+                .device()
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("web_frame_encoder"),
+                });
         let scene_start = perf.now();
         let billboard_enabled = previewing && perf_toggles.billboard && !preview_error;
         let billboard_pixel_rect: [f32; 4] = if billboard_enabled {
@@ -1566,20 +1742,36 @@ impl App {
                     params.dither = Some(0.3);
                     params.vhs = Some(0.5);
                     params.jitter = Some(0.1);
-                    params.supersample = true;
+                    params.supersample = render_config.preview_render_scale > 1.01;
                     params.render_scale = Some(render_config.preview_render_scale);
+                    params.ssao_strength = Some(render_config.shadow_strength);
+                    params.ssao_depth_threshold = Some(render_config.shadow_depth_threshold);
+                    params.ssao_start_dist = Some(render_config.shadow_start_dist);
+                    params.ssao_step_growth = Some(render_config.shadow_step_growth);
+                    params.ssao_max_shadow = Some(render_config.shadow_max);
+                    params.ssao_jitter_spread = Some(render_config.shadow_jitter_spread);
+                    params.ssao_max_depth_delta = Some(render_config.shadow_max_depth_delta);
+                    params.ssao_bbox_padding = Some(render_config.shadow_bbox_padding);
+                    params.ssao_steps = Some(render_config.shadow_steps);
+                    params.ssao_empty_depth_mode = Some(render_config.shadow_empty_depth_mode);
+                    params.shadow_mode = Some(render_config.shadow_mode);
+                    params.precomputed_shadow_bins = Some(render_config.precomputed_shadow_bins);
+                    params.precomputed_shadow_resolution =
+                        Some(render_config.precomputed_shadow_resolution);
                     if let Some(index) = self.current_preview_frame_index(preview_scene_time_secs) {
-                        self.renderer.render_animated_frame_to_offscreen_params(
-                            self.preview_asset_revision,
-                            &self.preview_frames,
-                            index,
-                            self.preview_w,
-                            self.preview_h,
-                            render_w,
-                            render_h,
-                            preview_scene_time_secs,
-                            &params,
-                        )?;
+                        self.renderer
+                            .render_animated_frame_to_offscreen_params_into(
+                                &mut frame_encoder,
+                                self.preview_asset_revision,
+                                &self.preview_frames,
+                                index,
+                                self.preview_w,
+                                self.preview_h,
+                                render_w,
+                                render_h,
+                                preview_scene_time_secs,
+                                &params,
+                            )?;
                     }
                 }
 
@@ -1599,62 +1791,8 @@ impl App {
         };
         let scene_ms = (perf.now() - scene_start) as f32;
 
-        if billboard_enabled {
-            self.ensure_billboard_effect_bind_group(self.renderer.render_target_generation());
-            let effect_uniforms = BlitUniforms {
-                output_size: [
-                    self.billboard_effect_width as f32,
-                    self.billboard_effect_height as f32,
-                ],
-                opacity: 1.0,
-                apply_transfer: 1.0,
-                dest_rect: [
-                    0.0,
-                    0.0,
-                    self.billboard_effect_width as f32,
-                    self.billboard_effect_height as f32,
-                ],
-                uv_rect: [0.0, 0.0, 1.0, 1.0],
-                transfer_tuning: [
-                    transfer.linear_gain,
-                    transfer.gamma,
-                    transfer.lift,
-                    transfer.saturation,
-                ],
-                extra_params: [1.0, 0.0, 0.0, time_secs as f32],
-            };
-            self.renderer.queue().write_buffer(
-                &self.billboard_blit_uniform_buffer,
-                0,
-                bytemuck::bytes_of(&effect_uniforms),
-            );
-            let mut encoder =
-                self.renderer
-                    .device()
-                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                        label: Some("billboard_effect_encoder"),
-                    });
-            {
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("billboard_effect_pass"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &self.billboard_effect_view,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    ..Default::default()
-                });
-                pass.set_pipeline(&self.blit_pipeline_opaque);
-                pass.set_bind_group(0, &self.billboard_effect_bind_group, &[]);
-                pass.draw(0..6, 0..1);
-            }
-            self.renderer.queue().submit(Some(encoder.finish()));
-        }
-
         let screen_redrew = self.screen_dirty;
+        let mut screen_encoded = false;
         let screen_start = perf.now();
         if self.screen_dirty {
             let screen_uniforms = CompositeUniforms {
@@ -1699,14 +1837,8 @@ impl App {
                 bytemuck::bytes_of(&screen_uniforms),
             );
             self.ensure_screen_bind_group(render_config.overlay_filter);
-            let mut encoder =
-                self.renderer
-                    .device()
-                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                        label: Some("screen_effect_encoder"),
-                    });
             {
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                let mut pass = frame_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("screen_effect_pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                         view: &self.screen_texture_view,
@@ -1722,12 +1854,7 @@ impl App {
                 pass.set_bind_group(0, &self.screen_bind_group, &[]);
                 pass.draw(0..3, 0..1);
             }
-            self.renderer.queue().submit(Some(encoder.finish()));
-            self.screen_dirty = false;
-            self.last_screen_transfer = transfer;
-            self.last_screen_perf_toggles = perf_toggles;
-            self.last_screen_render_config = render_config;
-            self.last_screen_preview_mix = preview_mix;
+            screen_encoded = true;
         }
         let screen_ms = (perf.now() - screen_start) as f32;
 
@@ -1812,24 +1939,19 @@ impl App {
             .create_view(&wgpu::TextureViewDescriptor::default());
 
         let composite_start = perf.now();
-        let has_egui_paint = !paint_jobs.is_empty();
-        let mut encoder =
-            self.renderer
-                .device()
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("composite_encoder"),
-                });
-        if has_egui_paint {
+        let has_egui_paint = self.settings_visible && !self.egui_cached_paint_jobs.is_empty();
+        if has_egui_paint && self.egui_buffers_dirty {
             self.egui_renderer.update_buffers(
                 self.renderer.device(),
                 self.renderer.queue(),
-                &mut encoder,
-                &paint_jobs,
+                &mut frame_encoder,
+                &self.egui_cached_paint_jobs,
                 &screen_descriptor,
             );
+            self.egui_buffers_dirty = false;
         }
         {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            let mut pass = frame_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("composite_pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
@@ -1846,7 +1968,7 @@ impl App {
             pass.draw(0..3, 0..1);
         }
         if has_egui_paint {
-            let mut pass = encoder
+            let mut pass = frame_encoder
                 .begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("egui_pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1861,13 +1983,20 @@ impl App {
                 })
                 .forget_lifetime();
             self.egui_renderer
-                .render(&mut pass, &paint_jobs, &screen_descriptor);
+                .render(&mut pass, &self.egui_cached_paint_jobs, &screen_descriptor);
         }
 
         let submit_start = perf.now();
-        self.renderer.queue().submit(Some(encoder.finish()));
+        self.renderer.queue().submit(Some(frame_encoder.finish()));
         let submit_ms = (perf.now() - submit_start) as f32;
-        for id in &panel_response.textures_delta.free {
+        if screen_encoded {
+            self.screen_dirty = false;
+            self.last_screen_transfer = transfer;
+            self.last_screen_perf_toggles = perf_toggles;
+            self.last_screen_render_config = render_config;
+            self.last_screen_preview_mix = preview_mix;
+        }
+        for id in &egui_texture_free_ids {
             self.egui_renderer.free_texture(id);
         }
         let present_start = perf.now();
@@ -1887,26 +2016,28 @@ impl App {
         self.smoothed_screen_ms = self.smoothed_screen_ms * 0.85 + screen_ms * 0.15;
         self.smoothed_scene_ms = self.smoothed_scene_ms * 0.85 + scene_ms * 0.15;
         self.smoothed_composite_ms = self.smoothed_composite_ms * 0.85 + composite_ms * 0.15;
-        self.publish_perf_metrics(
-            fps_label,
-            previewing,
-            terminal_redrew,
-            screen_redrew,
-            overlay_w,
-            overlay_h,
-            terminal_ms,
-            scene_ms,
-            composite_ms,
-            acquire_ms,
-            submit_ms,
-            present_ms,
-            frame_cpu_ms,
-            frame_interval_ms,
-            estimated_idle_ms,
-            client_w,
-            client_h,
-            perf_toggles,
-        );
+        if self.settings_visible {
+            self.publish_perf_metrics(
+                fps_label,
+                previewing,
+                terminal_redrew,
+                screen_redrew,
+                overlay_w,
+                overlay_h,
+                terminal_ms,
+                scene_ms,
+                composite_ms,
+                acquire_ms,
+                submit_ms,
+                present_ms,
+                frame_cpu_ms,
+                frame_interval_ms,
+                estimated_idle_ms,
+                client_w,
+                client_h,
+                perf_toggles,
+            );
+        }
 
         Ok(())
     }
@@ -2230,7 +2361,9 @@ impl App {
         }
 
         let billboard_view = if uses_billboard {
-            &self.billboard_effect_view
+            self.renderer
+                .offscreen_view()
+                .unwrap_or(&self.placeholder_billboard_view)
         } else {
             &self.placeholder_billboard_view
         };
@@ -2277,57 +2410,6 @@ impl App {
         self.composite_uses_billboard = uses_billboard;
         self.composite_display_pixelated = display_pixelated;
         self.composite_billboard_generation = billboard_generation;
-    }
-
-    fn ensure_billboard_effect_bind_group(&mut self, billboard_generation: u64) {
-        let effect_w = self.renderer.offscreen_width().unwrap_or(1).max(1);
-        let effect_h = self.renderer.offscreen_height().unwrap_or(1).max(1);
-        let effect_resized =
-            self.billboard_effect_width != effect_w || self.billboard_effect_height != effect_h;
-        if effect_resized {
-            let (texture, view) = create_render_target_texture(
-                self.renderer.device(),
-                effect_w,
-                effect_h,
-                "billboard_effect_texture",
-            );
-            self.billboard_effect_texture = texture;
-            self.billboard_effect_view = view;
-            self.billboard_effect_width = effect_w;
-            self.billboard_effect_height = effect_h;
-            self.composite_billboard_generation = u64::MAX;
-        }
-
-        if effect_resized || self.billboard_effect_generation != billboard_generation {
-            let billboard_view = self
-                .renderer
-                .offscreen_view()
-                .unwrap_or(&self.placeholder_billboard_view);
-            self.billboard_effect_bind_group =
-                self.renderer
-                    .device()
-                    .create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some("billboard_effect_bg"),
-                        layout: &self.blit_bind_group_layout,
-                        entries: &[
-                            wgpu::BindGroupEntry {
-                                binding: 0,
-                                resource: wgpu::BindingResource::TextureView(billboard_view),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 1,
-                                resource: wgpu::BindingResource::Sampler(
-                                    &self.billboard_sampler_linear,
-                                ),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 2,
-                                resource: self.billboard_blit_uniform_buffer.as_entire_binding(),
-                            },
-                        ],
-                    });
-            self.billboard_effect_generation = billboard_generation;
-        }
     }
 
     fn ensure_screen_bind_group(&mut self, overlay_filter: bool) {

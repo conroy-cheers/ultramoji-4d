@@ -5,3 +5,4 @@
 /crates/emoji-web/perf/node_modules/
 /crates/emoji-web/perf/out/
 *.pyc
+/.direnv

@@ -20,11 +20,16 @@ enum DisplayedMenu {
 
 pub struct EmojiEntry {
     pub name: String,
+    pub category: String,
 }
 
 pub struct Gallery {
     entries: Vec<EmojiEntry>,
+    lower_names: Vec<String>,
+    categories: Vec<String>,
+    filtered_indices: Vec<usize>,
     selected: usize,
+    active_category: usize,
     search: String,
     preview_index: Option<usize>,
     preview_mix: f32,
@@ -64,6 +69,8 @@ pub enum HostedAuthPrompt {
 pub enum KeyAction {
     Up,
     Down,
+    Left,
+    Right,
     PageUp,
     PageDown,
     F2,
@@ -72,6 +79,7 @@ pub enum KeyAction {
     Escape,
     Char(char),
     Backspace,
+    BackspaceWord,
 }
 
 impl Gallery {
@@ -80,12 +88,19 @@ impl Gallery {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        Self {
+        let mut gallery = Self {
             entries: entries
                 .into_iter()
-                .map(|name| EmojiEntry { name: name.into() })
+                .map(|name| EmojiEntry {
+                    name: name.into(),
+                    category: "emoji".to_owned(),
+                })
                 .collect(),
+            lower_names: Vec::new(),
+            categories: Vec::new(),
+            filtered_indices: Vec::new(),
             selected: 0,
+            active_category: 0,
             search: String::new(),
             preview_index: None,
             preview_mix: 0.0,
@@ -110,7 +125,9 @@ impl Gallery {
             sign_out_request_nonce: 0,
             displayed_menu: DisplayedMenu::Auth,
             displayed_menu_hold_secs: MENU_DWELL_SECS,
-        }
+        };
+        gallery.rebuild_catalog_metadata();
+        gallery
     }
 
     pub fn is_previewing(&self) -> bool {
@@ -178,6 +195,7 @@ impl Gallery {
             self.channel_switch_loading = false;
             self.search.clear();
             self.selected = 0;
+            self.active_category = 0;
             self.settings_open = false;
         }
     }
@@ -199,24 +217,37 @@ impl Gallery {
     }
 
     pub fn current_entry_name(&self) -> Option<&str> {
+        if self.preview_target > 0.0 {
+            return self
+                .preview_index
+                .and_then(|preview_index| self.entries.get(preview_index))
+                .map(|entry| entry.name.as_str());
+        }
         let filtered = self.filtered_entries();
-        if filtered.is_empty() {
+        filtered
+            .get(self.selected.min(filtered.len().saturating_sub(1)))
+            .map(|(_, entry)| entry.name.as_str())
+    }
+
+    pub fn preview_entry_name(&self) -> Option<&str> {
+        if self.preview_target <= 0.0 {
             return None;
         }
-        let current_filtered_index = if self.preview_target > 0.0 {
-            self.preview_index()
-                .and_then(|preview_index| {
-                    filtered
-                        .iter()
-                        .position(|(real_index, _)| *real_index == preview_index)
-                })
-                .unwrap_or(self.selected.min(filtered.len().saturating_sub(1)))
-        } else {
-            self.selected.min(filtered.len().saturating_sub(1))
-        };
-        filtered
-            .get(current_filtered_index)
-            .map(|(_, entry)| entry.name.as_str())
+        self.preview_index
+            .and_then(|preview_index| self.entries.get(preview_index))
+            .map(|entry| entry.name.as_str())
+    }
+
+    pub fn search_query(&self) -> &str {
+        &self.search
+    }
+
+    pub fn previous_preview_entry_name(&self) -> Option<&str> {
+        self.preview_neighbor_name(-1)
+    }
+
+    pub fn next_preview_entry_name(&self) -> Option<&str> {
+        self.preview_neighbor_name(1)
     }
 
     pub fn set_entries<I, S>(&mut self, entries: I)
@@ -227,12 +258,16 @@ impl Gallery {
         let current_name = self.current_entry_name().map(str::to_owned);
         self.entries = entries
             .into_iter()
-            .map(|name| EmojiEntry { name: name.into() })
+            .map(|line| {
+                let line: String = line.into();
+                parse_entry_line(&line)
+            })
             .collect();
+        self.rebuild_catalog_metadata();
 
-        let filtered = self.filtered_entries();
-        if filtered.is_empty() {
+        if self.filtered_indices.is_empty() {
             self.selected = 0;
+            self.active_category = 0;
             self.preview_index = None;
             self.preview_target = 0.0;
             self.preview_mix = 0.0;
@@ -245,18 +280,22 @@ impl Gallery {
         let next_index = current_name
             .as_deref()
             .and_then(|name| {
-                filtered
+                self.filtered_indices
                     .iter()
-                    .position(|(_, entry)| entry.name.as_str() == name)
+                    .position(|index| self.entries[*index].name.as_str() == name)
             })
-            .unwrap_or_else(|| self.selected.min(filtered.len().saturating_sub(1)));
+            .unwrap_or_else(|| {
+                self.selected
+                    .min(self.filtered_indices.len().saturating_sub(1))
+            });
         let next_preview_index = if self.preview_index.is_some() {
-            filtered.get(next_index).map(|(real_index, _)| *real_index)
+            self.filtered_indices.get(next_index).copied()
         } else {
             None
         };
         self.selected = next_index;
         self.preview_index = next_preview_index;
+        self.sync_active_category_to_selection();
     }
 
     pub fn tick(&mut self, dt_secs: f32) {
@@ -302,6 +341,11 @@ impl Gallery {
         if matches!(action, KeyAction::F2) && !self.is_previewing() {
             if self.auth.signed_in {
                 self.settings_open = !self.settings_open;
+                self.show_menu_now(if self.settings_open {
+                    DisplayedMenu::Settings
+                } else {
+                    DisplayedMenu::Main
+                });
             } else if !self.auth.busy
                 && matches!(self.auth.auth_prompt, HostedAuthPrompt::OpenLogin)
             {
@@ -315,9 +359,11 @@ impl Gallery {
                 KeyAction::Enter => {
                     self.sign_out_request_nonce = self.sign_out_request_nonce.wrapping_add(1);
                     self.settings_open = false;
+                    self.show_menu_now(DisplayedMenu::Main);
                 }
                 KeyAction::Escape => {
                     self.settings_open = false;
+                    self.show_menu_now(DisplayedMenu::Main);
                 }
                 _ => {}
             }
@@ -328,7 +374,10 @@ impl Gallery {
             match action {
                 KeyAction::Up => self.move_preview_selection(-1),
                 KeyAction::Down => self.move_preview_selection(1),
-                KeyAction::Escape | KeyAction::Backspace => {
+                KeyAction::Left | KeyAction::Right => {
+                    self.preview_target = 0.0;
+                }
+                KeyAction::Escape | KeyAction::Backspace | KeyAction::BackspaceWord => {
                     self.preview_target = 0.0;
                 }
                 _ => {}
@@ -339,12 +388,13 @@ impl Gallery {
         match action {
             KeyAction::Up => self.move_selection(-1),
             KeyAction::Down => self.move_selection(1),
+            KeyAction::Left => self.move_category(-1),
+            KeyAction::Right => self.move_category(1),
             KeyAction::PageUp => self.page_selection(-1),
             KeyAction::PageDown => self.page_selection(1),
             KeyAction::F2 | KeyAction::F8 => {}
             KeyAction::Enter => {
-                let filtered = self.filtered_entries();
-                if let Some(&(real_index, _)) = filtered.get(self.selected) {
+                if let Some(real_index) = self.filtered_index(self.selected) {
                     self.preview_index = Some(real_index);
                     self.preview_target = 1.0;
                     self.preview_reset_nonce = self.preview_reset_nonce.wrapping_add(1);
@@ -353,28 +403,77 @@ impl Gallery {
             KeyAction::Char(c) => {
                 self.search.push(c);
                 self.selected = 0;
+                self.rebuild_filtered_indices();
             }
             KeyAction::Backspace => {
                 self.search.pop();
                 self.selected = 0;
+                self.rebuild_filtered_indices();
+                if self.search.is_empty() {
+                    self.select_first_in_active_category();
+                }
+            }
+            KeyAction::BackspaceWord => {
+                self.pop_search_word();
+                self.selected = 0;
+                self.rebuild_filtered_indices();
+                if self.search.is_empty() {
+                    self.select_first_in_active_category();
+                }
             }
             KeyAction::Escape => {
                 if !self.search.is_empty() {
                     self.search.clear();
                     self.selected = 0;
+                    self.rebuild_filtered_indices();
+                    self.select_first_in_active_category();
                 }
             }
         }
     }
 
     pub fn enter_preview_immediate(&mut self) {
-        let filtered = self.filtered_entries();
-        if let Some(&(real_index, _)) = filtered.get(self.selected) {
+        if let Some(real_index) = self.filtered_index(self.selected) {
             self.preview_index = Some(real_index);
             self.preview_target = 1.0;
             self.preview_mix = 1.0;
             self.preview_reset_nonce = self.preview_reset_nonce.wrapping_add(1);
         }
+    }
+
+    pub fn apply_route_state(&mut self, search: String, preview_name: String) -> bool {
+        let previous_search = self.search.clone();
+        let previous_preview = self.preview_entry_name().map(str::to_owned);
+
+        self.search = search;
+        self.selected = 0;
+        self.rebuild_filtered_indices();
+        if self.search.is_empty() {
+            self.select_first_in_active_category();
+        }
+
+        if preview_name.is_empty() {
+            self.preview_target = 0.0;
+        } else if let Some(real_index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.name == preview_name)
+        {
+            self.selected = self
+                .filtered_indices
+                .iter()
+                .position(|index| *index == real_index)
+                .unwrap_or(0);
+            self.preview_index = Some(real_index);
+            self.preview_target = 1.0;
+            self.preview_mix = 1.0;
+            self.preview_error = false;
+            self.preview_reset_nonce = self.preview_reset_nonce.wrapping_add(1);
+        } else {
+            self.preview_target = 0.0;
+        }
+
+        previous_search != self.search || previous_preview.as_deref() != self.preview_entry_name()
     }
 
     pub fn new() -> Self {
@@ -422,55 +521,87 @@ impl Gallery {
     }
 
     fn move_selection(&mut self, delta: isize) {
-        let filtered = self.filtered_entries();
-        if filtered.is_empty() {
+        if self.filtered_indices.is_empty() {
             self.selected = 0;
             return;
         }
         let current = self.selected as isize;
-        let len = filtered.len() as isize;
+        let len = self.filtered_indices.len() as isize;
         let next = ((current + delta) % len + len) % len;
         self.selected = next as usize;
+        self.sync_active_category_to_selection();
     }
 
     fn page_selection(&mut self, delta_pages: isize) {
-        let filtered = self.filtered_entries();
-        if filtered.is_empty() {
+        if self.filtered_indices.is_empty() {
             self.selected = 0;
             return;
         }
         let page = TERM_ROWS.saturating_sub(4).max(1) as isize;
-        let max_index = filtered.len().saturating_sub(1) as isize;
+        let max_index = self.filtered_indices.len().saturating_sub(1) as isize;
         let next = (self.selected as isize + delta_pages * page).clamp(0, max_index);
         self.selected = next as usize;
+        self.sync_active_category_to_selection();
+    }
+
+    fn move_category(&mut self, delta: isize) {
+        if !self.search.is_empty() || self.categories.len() <= 1 {
+            return;
+        }
+        let len = self.categories.len() as isize;
+        let next = ((self.active_category as isize + delta) % len + len) % len;
+        self.active_category = next as usize;
+        self.rebuild_filtered_indices();
+        self.select_first_in_active_category();
     }
 
     fn move_preview_selection(&mut self, delta: isize) {
-        let filtered = self.filtered_entries();
-        if filtered.is_empty() {
+        if self.filtered_indices.is_empty() {
             return;
         }
         let current = self
             .preview_index
-            .and_then(|preview_index| {
-                filtered
-                    .iter()
-                    .position(|(real_index, _)| *real_index == preview_index)
-            })
-            .unwrap_or(self.selected.min(filtered.len().saturating_sub(1)));
-        let max_index = filtered.len().saturating_sub(1) as isize;
+            .and_then(|preview_index| self.filtered_position(preview_index))
+            .unwrap_or(
+                self.selected
+                    .min(self.filtered_indices.len().saturating_sub(1)),
+            );
+        let max_index = self.filtered_indices.len().saturating_sub(1) as isize;
         let next = (current as isize + delta).clamp(0, max_index) as usize;
         if next == current {
             return;
         }
-        let next_real_index = filtered[next].0;
+        let next_real_index = self.filtered_indices[next];
         self.selected = next;
         self.preview_index = Some(next_real_index);
+        self.sync_active_category_to_selection();
         self.preview_error = false;
         self.channel_switch = 1.0;
         self.channel_switch_dir = if delta < 0 { -1.0 } else { 1.0 };
         self.channel_switch_loading = true;
         self.preview_reset_nonce = self.preview_reset_nonce.wrapping_add(1);
+    }
+
+    fn preview_neighbor_name(&self, delta: isize) -> Option<&str> {
+        if self.filtered_indices.is_empty() {
+            return None;
+        }
+        let current = self
+            .preview_index
+            .and_then(|preview_index| self.filtered_position(preview_index))
+            .unwrap_or(
+                self.selected
+                    .min(self.filtered_indices.len().saturating_sub(1)),
+            );
+        let next = current as isize + delta;
+        if !(0..self.filtered_indices.len() as isize).contains(&next) {
+            return None;
+        }
+        Some(
+            self.entries[self.filtered_indices[next as usize]]
+                .name
+                .as_str(),
+        )
     }
 
     pub fn billboard_cell_rect(&self, area_width: u16, area_height: u16) -> Option<CellRect> {
@@ -486,14 +617,162 @@ impl Gallery {
     }
 
     fn filtered_entries(&self) -> Vec<(usize, &EmojiEntry)> {
-        let search = self.search.to_ascii_lowercase();
-        self.entries
+        self.filtered_indices
             .iter()
-            .enumerate()
-            .filter(|(_, entry)| {
-                search.is_empty() || entry.name.to_ascii_lowercase().contains(&search)
-            })
+            .map(|index| (*index, &self.entries[*index]))
             .collect()
+    }
+
+    fn categories(&self) -> Vec<&str> {
+        self.categories.iter().map(String::as_str).collect()
+    }
+
+    fn active_category_name(&self) -> Option<&str> {
+        self.categories
+            .get(self.active_category)
+            .map(String::as_str)
+    }
+
+    fn clamp_active_category(&mut self) {
+        let category_count = self.categories.len();
+        if category_count == 0 {
+            self.active_category = 0;
+        } else {
+            self.active_category = self.active_category.min(category_count - 1);
+        }
+    }
+
+    fn rebuild_catalog_metadata(&mut self) {
+        self.lower_names = self
+            .entries
+            .iter()
+            .map(|entry| entry.name.to_ascii_lowercase())
+            .collect();
+        self.categories.clear();
+        for entry in &self.entries {
+            if self.categories.last() != Some(&entry.category) {
+                self.categories.push(entry.category.clone());
+            }
+        }
+        self.clamp_active_category();
+        self.rebuild_filtered_indices();
+    }
+
+    fn rebuild_filtered_indices(&mut self) {
+        self.filtered_indices.clear();
+        if self.search.is_empty() {
+            let active_category = self.active_category_name().map(str::to_owned);
+            self.filtered_indices.extend(
+                self.entries
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, entry)| {
+                        active_category
+                            .as_deref()
+                            .is_none_or(|category| entry.category == category)
+                    })
+                    .map(|(index, _)| index),
+            );
+        } else {
+            let search = self.search.to_ascii_lowercase();
+            self.filtered_indices.extend(
+                self.lower_names
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, name)| name.contains(&search))
+                    .map(|(index, _)| index),
+            );
+        }
+        self.selected = self
+            .selected
+            .min(self.filtered_indices.len().saturating_sub(1));
+    }
+
+    fn filtered_index(&self, selected: usize) -> Option<usize> {
+        self.filtered_indices.get(selected).copied()
+    }
+
+    fn filtered_position(&self, real_index: usize) -> Option<usize> {
+        self.filtered_indices
+            .iter()
+            .position(|index| *index == real_index)
+    }
+
+    fn sync_active_category_to_selection(&mut self) {
+        if !self.search.is_empty() {
+            return;
+        }
+        let Some(real_index) = self.filtered_index(self.selected) else {
+            return;
+        };
+        let Some(entry) = self.entries.get(real_index) else {
+            return;
+        };
+        if let Some(index) = self
+            .categories
+            .iter()
+            .position(|category| category == &entry.category)
+        {
+            self.active_category = index;
+            self.rebuild_filtered_indices();
+            self.selected = self.filtered_position(real_index).unwrap_or(0);
+        }
+    }
+
+    fn select_first_in_active_category(&mut self) {
+        self.selected = 0;
+        self.rebuild_filtered_indices();
+    }
+
+    fn pop_search_word(&mut self) {
+        while self
+            .search
+            .chars()
+            .next_back()
+            .is_some_and(char::is_whitespace)
+        {
+            self.search.pop();
+        }
+        while let Some(ch) = self.search.chars().next_back() {
+            if ch.is_whitespace() {
+                break;
+            }
+            self.search.pop();
+        }
+        while self
+            .search
+            .chars()
+            .next_back()
+            .is_some_and(char::is_whitespace)
+        {
+            self.search.pop();
+        }
+    }
+
+    fn show_menu_now(&mut self, menu: DisplayedMenu) {
+        self.displayed_menu = menu;
+        self.displayed_menu_hold_secs = 0.0;
+    }
+}
+
+fn parse_entry_line(line: &str) -> EmojiEntry {
+    let trimmed = line.trim();
+    if let Some((category, name)) = trimmed.split_once('\t') {
+        let category = category.trim();
+        EmojiEntry {
+            name: name.trim().to_owned(),
+            category: if category.is_empty() {
+                "emoji"
+            } else {
+                category
+            }
+            .to_owned(),
+        }
+    } else {
+        EmojiEntry {
+            name: trimmed.to_owned(),
+            category: "emoji".to_owned(),
+        }
     }
 }
 
@@ -566,9 +845,9 @@ fn put_segments_bg(
 }
 
 fn draw_gallery(grid: &mut TerminalGrid, gallery: &Gallery, time_secs: f64) {
-    draw_header(grid, gallery, time_secs);
-    draw_emoji_list(grid, gallery);
-    draw_footer(grid, gallery);
+    draw_header(grid, gallery);
+    draw_emoji_list(grid, gallery, time_secs);
+    draw_footer(grid);
 }
 
 fn wrap_lines(text: &str, width: usize) -> Vec<String> {
@@ -668,13 +947,13 @@ fn draw_auth_screen(grid: &mut TerminalGrid, gallery: &Gallery, time_secs: f64) 
 fn draw_settings_screen(grid: &mut TerminalGrid, gallery: &Gallery, time_secs: f64) {
     let cursor = if cursor_blink_on(time_secs) { "_" } else { " " };
     grid.put_centered(5, "SETTINGS", BRIGHT, BG);
-    grid.put_centered(7, &format!("TERMINAL MENU{cursor}"), GREEN, BG);
+    grid.put_centered(7, "TERMINAL MENU", GREEN, BG);
 
     if !gallery.auth.workspace.is_empty() {
         grid.put_centered(10, &gallery.auth.workspace, YELLOW, BG);
     }
 
-    grid.put_centered(14, "> SIGN OUT OF SLACK", WHITE, BG);
+    grid.put_centered(14, &format!("> SIGN OUT OF SLACK{cursor}"), WHITE, BG);
     grid.put_centered(17, "PRESS ENTER TO CONFIRM", BRIGHT, BG);
     grid.put_centered(19, "PRESS ESC TO GO BACK", DIM_GRAY, BG);
 
@@ -691,14 +970,8 @@ fn draw_settings_screen(grid: &mut TerminalGrid, gallery: &Gallery, time_secs: f
     );
 }
 
-fn draw_header(grid: &mut TerminalGrid, gallery: &Gallery, time_secs: f64) {
-    let cursor = if cursor_blink_on(time_secs) { "_" } else { " " };
-    put_segments(
-        grid,
-        0,
-        0,
-        &[(" ULTRAMOJI VIEWER 4D", BRIGHT), (cursor, GREEN)],
-    );
+fn draw_header(grid: &mut TerminalGrid, gallery: &Gallery) {
+    put_segments(grid, 0, 0, &[(" ULTRAMOJI VIEWER 4D", BRIGHT)]);
     let header_hint = if gallery.auth.signed_in {
         Some("F2 SETTINGS")
     } else if !gallery.auth.busy && matches!(gallery.auth.auth_prompt, HostedAuthPrompt::OpenLogin)
@@ -713,20 +986,34 @@ fn draw_header(grid: &mut TerminalGrid, gallery: &Gallery, time_secs: f64) {
     }
 }
 
-fn draw_emoji_list(grid: &mut TerminalGrid, gallery: &Gallery) {
+fn draw_emoji_list(grid: &mut TerminalGrid, gallery: &Gallery, time_secs: f64) {
     let filtered = gallery.filtered_entries();
     let count = filtered.len();
+    if gallery.search.is_empty() {
+        draw_category_tabs(grid, gallery, 1);
+    } else {
+        draw_search_row(grid, gallery, 1, time_secs);
+    }
+
     let title = format!(" EMOJI {:>3} ", count);
     let mut rule = ascii_rule(TERM_COLS);
     let title_len = title.len().min(rule.len());
     rule.replace_range(0..title_len, &title[..title_len]);
-    grid.put_text(0, 1, &rule, DIM, BG);
+    grid.put_text(0, 2, &rule, DIM, BG);
 
-    let list_top = 2u16;
-    let list_height = TERM_ROWS.saturating_sub(4) as usize;
+    let list_top = 3u16;
+    let list_height = TERM_ROWS.saturating_sub(5) as usize;
     if count == 0 {
-        grid.put_centered(list_top + 1, "NO EMOJI LOADED", DIM_GRAY, BG);
-        grid.put_centered(list_top + 3, "EMOJI CATALOG UNAVAILABLE", DIM, BG);
+        if gallery.entries.is_empty() {
+            grid.put_centered(list_top + 1, "NO EMOJI LOADED", DIM_GRAY, BG);
+            grid.put_centered(list_top + 3, "EMOJI CATALOG UNAVAILABLE", DIM, BG);
+        } else if !gallery.search.is_empty() {
+            grid.put_centered(list_top + 1, "NO SEARCH RESULTS", DIM_GRAY, BG);
+            grid.put_centered(list_top + 3, "TRY A DIFFERENT EMOJI NAME", DIM, BG);
+        } else {
+            grid.put_centered(list_top + 1, "NO EMOJI IN CATEGORY", DIM_GRAY, BG);
+            grid.put_centered(list_top + 3, "SELECT ANOTHER CATEGORY", DIM, BG);
+        }
         let bottom_rule = ascii_rule(TERM_COLS);
         grid.put_text(0, TERM_ROWS - 2, &bottom_rule, DIM, BG);
         return;
@@ -744,12 +1031,123 @@ fn draw_emoji_list(grid: &mut TerminalGrid, gallery: &Gallery) {
         }
         let y = list_top + row as u16;
         let (_, entry) = filtered[idx];
-        let selected = idx == gallery.selected;
-        draw_entry(grid, y, &entry.name, selected);
+        draw_entry(grid, y, &entry.name, idx == gallery.selected);
     }
 
     let bottom_rule = ascii_rule(TERM_COLS);
     grid.put_text(0, TERM_ROWS - 2, &bottom_rule, DIM, BG);
+}
+
+fn draw_search_row(grid: &mut TerminalGrid, gallery: &Gallery, y: u16, time_secs: f64) {
+    let prefix = " SEARCH > ";
+    let available = TERM_COLS as usize;
+    let max_query = available.saturating_sub(prefix.len() + 1);
+    let mut query = gallery.search.clone();
+    if query.chars().count() > max_query {
+        let tail: String = query
+            .chars()
+            .rev()
+            .take(max_query.saturating_sub(1))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        query = format!(">{tail}");
+    }
+    let cursor = if cursor_blink_on(time_secs) { "_" } else { " " };
+    put_segments(
+        grid,
+        0,
+        y,
+        &[
+            (" SEARCH ", DIM_GRAY),
+            ("> ", BRIGHT),
+            (query.as_str(), GREEN),
+            (cursor, BRIGHT),
+        ],
+    );
+}
+
+fn draw_category_tabs(grid: &mut TerminalGrid, gallery: &Gallery, y: u16) {
+    let categories = gallery.categories();
+    if categories.is_empty() {
+        return;
+    }
+
+    let tab_widths: Vec<usize> = categories
+        .iter()
+        .map(|category| category.chars().count() + 3)
+        .collect();
+    let total_width: usize = tab_widths.iter().sum();
+    let viewport = TERM_COLS as usize;
+    let active = gallery
+        .active_category
+        .min(categories.len().saturating_sub(1));
+    let active_start: usize = tab_widths.iter().take(active).sum();
+    let active_end = active_start + tab_widths[active];
+    let mut scroll = active_start.saturating_sub(viewport / 3);
+
+    for _ in 0..2 {
+        let has_left = scroll > 0;
+        let left_chrome = if has_left { 4 } else { 0 };
+        let has_right = scroll + viewport.saturating_sub(left_chrome) < total_width;
+        let right_chrome = if has_right { 4 } else { 0 };
+        let available = viewport.saturating_sub(left_chrome + right_chrome);
+        scroll = scroll.min(total_width.saturating_sub(available));
+        if active_start < scroll {
+            scroll = active_start;
+        } else if active_end > scroll + available {
+            scroll = active_end.saturating_sub(available);
+        }
+    }
+
+    let has_left = scroll > 0;
+    let left_chrome = if has_left { 4 } else { 0 };
+    let has_right = scroll + viewport.saturating_sub(left_chrome) < total_width;
+    let right_chrome = if has_right { 4 } else { 0 };
+    let inner_x = if has_left {
+        grid.put_text(0, y, "<", YELLOW, BG);
+        grid.put_text(1, y, "...", DIM_GRAY, BG);
+        left_chrome
+    } else {
+        0usize
+    };
+    let inner_width = viewport.saturating_sub(inner_x + right_chrome);
+    let visible_start = scroll;
+    let visible_end = scroll + inner_width;
+
+    let mut source_x = 0usize;
+    for (index, category) in categories.iter().enumerate() {
+        let active = index == gallery.active_category;
+        let left = if active { "[" } else { " " };
+        let right = if active { "]" } else { " " };
+        let label = category.to_ascii_uppercase();
+        let color = if active { BRIGHT } else { DIM_GRAY };
+        for (text, color) in [
+            (left, if active { YELLOW } else { DIM }),
+            (label.as_str(), color),
+            (right, if active { YELLOW } else { DIM }),
+            (" ", DIM),
+        ] {
+            let text_width = text.chars().count();
+            let segment_start = source_x;
+            let segment_end = source_x + text_width;
+            if segment_end > visible_start && segment_start < visible_end {
+                let skip = visible_start.saturating_sub(segment_start);
+                let take = segment_end.min(visible_end) - (segment_start + skip);
+                let clipped: String = text.chars().skip(skip).take(take).collect();
+                let x = inner_x + segment_start.saturating_sub(visible_start) + skip;
+                grid.put_text(x as u16, y, &clipped, color, BG);
+            }
+            source_x = segment_end;
+        }
+    }
+    if has_right && TERM_COLS > 0 {
+        if TERM_COLS >= 4 {
+            grid.put_text(TERM_COLS - 4, y, "...", DIM_GRAY, BG);
+        }
+        grid.put_text(TERM_COLS - 1, y, ">", YELLOW, BG);
+    }
 }
 
 fn draw_entry(grid: &mut TerminalGrid, y: u16, name: &str, selected: bool) {
@@ -769,29 +1167,24 @@ fn draw_entry(grid: &mut TerminalGrid, y: u16, name: &str, selected: bool) {
     );
 }
 
-fn draw_footer(grid: &mut TerminalGrid, gallery: &Gallery) {
-    if !gallery.search.is_empty() {
-        put_segments(
-            grid,
-            0,
-            TERM_ROWS - 1,
-            &[(" >", BRIGHT), (&gallery.search, GREEN), ("_", BRIGHT)],
-        );
-    } else {
-        put_segments(
-            grid,
-            0,
-            TERM_ROWS - 1,
-            &[
-                (" UP/DN", BRIGHT),
-                (" MOVE  ", DIM),
-                ("PGUP/DN", BRIGHT),
-                (" PAGE  ", DIM),
-                ("ENTER", BRIGHT),
-                (" VIEW", DIM),
-            ],
-        );
-    }
+fn draw_footer(grid: &mut TerminalGrid) {
+    put_segments(
+        grid,
+        0,
+        TERM_ROWS - 1,
+        &[
+            (" UP/DN", BRIGHT),
+            (" MOVE  ", DIM),
+            ("PGUP/DN", BRIGHT),
+            (" PAGE  ", DIM),
+            ("ENTER", BRIGHT),
+            (" VIEW", DIM),
+            ("  L/R", BRIGHT),
+            (" TAB", DIM),
+            ("  CTRL/ALT-BS", BRIGHT),
+            (" WORD", DIM),
+        ],
+    );
 }
 
 fn draw_preview_overlay(grid: &mut TerminalGrid, gallery: &Gallery) {

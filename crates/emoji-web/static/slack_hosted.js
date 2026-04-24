@@ -8,6 +8,7 @@ const FETCH_MAX_BYTES = 8 * 1024 * 1024;
 const FETCH_TIMEOUT_MS = 20_000;
 const ACTIVE_POLL_MS = 100;
 const IDLE_POLL_MS = 1_000;
+const SKIN_TONE_UNIFIED_PARTS = new Set(['1f3fb', '1f3fc', '1f3fd', '1f3fe', '1f3ff']);
 
 function debugLogsEnabled() {
   try {
@@ -111,6 +112,20 @@ function canonicalizeStandardUnified(unified) {
     .join('-');
 }
 
+function hasSkinToneModifier(unified) {
+  return canonicalizeStandardUnified(unified)
+    .split('-')
+    .some((part) => SKIN_TONE_UNIFIED_PARTS.has(part));
+}
+
+function standardEmojiImageFilename(entry, unified) {
+  const image = String(entry?.image ?? '').trim().toLowerCase();
+  if (/^[0-9a-f-]+\.png$/i.test(image)) {
+    return image;
+  }
+  return `${unified}.png`;
+}
+
 function readConfig() {
   const config = window.SLACK_EMOJI_APP_CONFIG ?? {};
   return {
@@ -152,6 +167,94 @@ function savePkce(pkce) {
 
 function clearPkce() {
   localStorage.removeItem(PKCE_KEY);
+}
+
+function cleanOAuthParams(url = new URL(window.location.href)) {
+  const cleaned = new URL(url.toString());
+  cleaned.searchParams.delete('code');
+  cleaned.searchParams.delete('state');
+  cleaned.searchParams.delete('error');
+  cleaned.searchParams.delete('error_description');
+  return cleaned;
+}
+
+function sameOriginUrl(rawUrl) {
+  try {
+    const url = new URL(rawUrl, window.location.origin);
+    if (url.origin !== window.location.origin) {
+      return null;
+    }
+    return url;
+  } catch {
+    return null;
+  }
+}
+
+function currentReturnUrl() {
+  return cleanOAuthParams().toString();
+}
+
+function parseRoute() {
+  const pathParts = window.location.pathname.split('/').filter(Boolean);
+  const emojiName = pathParts[0] === 'emoji' && pathParts[1]
+    ? decodeURIComponent(pathParts.slice(1).join('/'))
+    : '';
+  return {
+    emojiName,
+    search: new URLSearchParams(window.location.search).get('q') || '',
+  };
+}
+
+function routeSignature(route) {
+  return `${route.emojiName}\n${route.search}`;
+}
+
+function routeUrl(route) {
+  const url = new URL(window.location.href);
+  url.pathname = route.emojiName ? `/emoji/${encodeURIComponent(route.emojiName)}` : '/';
+  url.search = '';
+  if (route.search) {
+    url.searchParams.set('q', route.search);
+  }
+  url.hash = '';
+  return url;
+}
+
+function currentRouteUrl() {
+  const url = new URL(window.location.href);
+  url.searchParams.delete('code');
+  url.searchParams.delete('state');
+  url.searchParams.delete('error');
+  url.searchParams.delete('error_description');
+  return `${url.pathname}${url.search}${url.hash}`;
+}
+
+function routeUrlPath(route) {
+  const url = routeUrl(route);
+  return `${url.pathname}${url.search}${url.hash}`;
+}
+
+function applyRouteToWasm(state) {
+  const route = parseRoute();
+  state.lastAppliedRouteSignature = routeSignature(route);
+  state.wasm.set_route_state(route.search, route.emojiName);
+  return route;
+}
+
+function syncUrlFromWasm(state) {
+  const route = {
+    emojiName: state.wasm.current_preview_emoji_name(),
+    search: state.wasm.current_search_query(),
+  };
+  const signature = routeSignature(route);
+  if (signature === state.lastWasmRouteSignature) {
+    return;
+  }
+  state.lastWasmRouteSignature = signature;
+  const nextPath = routeUrlPath(route);
+  if (nextPath !== currentRouteUrl()) {
+    history.replaceState({}, '', nextPath);
+  }
 }
 
 function pushUiState(wasm, {
@@ -249,11 +352,11 @@ function extractTokenPayload(payload) {
   };
 }
 
-async function buildPkceLoginUrl(config) {
+async function buildPkceLoginUrl(config, returnUrl = currentReturnUrl()) {
   const state = randomString(24);
   const verifier = randomString(48);
   const challenge = base64Url(await sha256(verifier));
-  savePkce({ state, verifier, redirectUri: config.redirectUri });
+  savePkce({ state, verifier, redirectUri: config.redirectUri, returnUrl });
   const url = new URL('https://slack.com/oauth/v2/authorize');
   url.searchParams.set('client_id', config.clientId);
   url.searchParams.set('redirect_uri', config.redirectUri);
@@ -269,12 +372,11 @@ async function maybeHandleOAuthCallback(config) {
   const code = url.searchParams.get('code');
   const state = url.searchParams.get('state');
   const error = url.searchParams.get('error');
+  const pkce = loadPkce();
+  const fallbackUrl = cleanOAuthParams(url).toString();
+  const returnUrl = sameOriginUrl(pkce?.returnUrl)?.toString() || fallbackUrl;
   if (error) {
-    url.searchParams.delete('error');
-    url.searchParams.delete('error_description');
-    url.searchParams.delete('state');
-    url.searchParams.delete('code');
-    history.replaceState({}, '', url);
+    history.replaceState({}, '', returnUrl);
     throw new Error(`Slack authorization failed: ${error}`);
   }
   if (!code) {
@@ -282,13 +384,9 @@ async function maybeHandleOAuthCallback(config) {
   }
   log('handling oauth callback');
 
-  url.searchParams.delete('code');
-  url.searchParams.delete('state');
-  history.replaceState({}, '', url);
-
-  const pkce = loadPkce();
   if (!pkce || pkce.state !== state) {
     clearPkce();
+    history.replaceState({}, '', fallbackUrl);
     log('ignoring stale oauth callback due to state mismatch');
     return null;
   }
@@ -300,6 +398,7 @@ async function maybeHandleOAuthCallback(config) {
     code_verifier: pkce.verifier,
   });
   clearPkce();
+  history.replaceState({}, '', returnUrl);
 
   const session = {
     ...extractTokenPayload(response),
@@ -348,7 +447,47 @@ async function ensureFreshSession(config, session) {
   return refreshed;
 }
 
-function resolveEmojiCatalog(rawEmoji) {
+function normalizeCategoryName(name, fallback = 'emoji') {
+  const normalized = String(name ?? '').trim().toLowerCase().replace(/\s+/g, ' ');
+  return normalized || fallback;
+}
+
+function uniqueNames(names) {
+  const seen = new Set();
+  const result = [];
+  for (const rawName of Array.isArray(names) ? names : []) {
+    const name = String(rawName ?? '').trim();
+    if (name && !seen.has(name)) {
+      seen.add(name);
+      result.push(name);
+    }
+  }
+  return result;
+}
+
+function extractCategoryNames(category) {
+  for (const key of ['emoji_names', 'emojiNames', 'emojis', 'names', 'emoji']) {
+    const value = category?.[key];
+    if (Array.isArray(value)) {
+      return uniqueNames(value);
+    }
+  }
+  return [];
+}
+
+function extractSlackCategories(rawCategories) {
+  const categories = [];
+  for (const category of Array.isArray(rawCategories) ? rawCategories : []) {
+    const name = normalizeCategoryName(category?.name || category?.label || category?.title, '');
+    const names = extractCategoryNames(category);
+    if (name && names.length > 0) {
+      categories.push({ name, names });
+    }
+  }
+  return categories;
+}
+
+function resolveEmojiCatalog(rawEmoji, rawCategories = []) {
   const resolvedUrl = new Map();
   const resolutionState = new Set();
 
@@ -382,7 +521,22 @@ function resolveEmojiCatalog(rawEmoji) {
     .filter((name) => Boolean(resolveValue(name)))
     .sort((a, b) => a.localeCompare(b));
 
-  return { names, assetUrls: resolvedUrl };
+  const slackCategories = extractSlackCategories(rawCategories);
+  const categorizedNames = new Set(slackCategories.flatMap((category) => category.names));
+  const customNames = names.filter((name) => !categorizedNames.has(name));
+  const categories = slackCategories.length > 0
+    ? [
+        ...slackCategories,
+        ...(customNames.length > 0 ? [{ name: 'custom', names: customNames }] : []),
+      ]
+    : [{ name: 'custom', names }];
+
+  return {
+    names,
+    assetUrls: resolvedUrl,
+    categories,
+    hasSlackCategories: slackCategories.length > 0,
+  };
 }
 
 async function fetchEmojiCatalog(session) {
@@ -391,7 +545,7 @@ async function fetchEmojiCatalog(session) {
     token: session.accessToken,
     include_categories: 'true',
   });
-  return resolveEmojiCatalog(payload.emoji);
+  return resolveEmojiCatalog(payload.emoji, payload.categories);
 }
 
 async function fetchStandardEmojiCatalog() {
@@ -408,14 +562,14 @@ async function fetchStandardEmojiCatalog() {
   const assetUrls = new Map();
   for (const entry of Array.isArray(entries) ? entries : []) {
     const unified = canonicalizeStandardUnified(entry?.unified);
-    if (!unified) {
+    if (!unified || hasSkinToneModifier(unified)) {
       continue;
     }
     const shortNames = Array.isArray(entry?.short_names) ? entry.short_names : [];
     if (shortNames.length === 0) {
       continue;
     }
-    const url = `${STANDARD_EMOJI_IMAGE_BASE_URL}/${unified}.png`;
+    const url = `${STANDARD_EMOJI_IMAGE_BASE_URL}/${standardEmojiImageFilename(entry, unified)}`;
     for (const shortName of shortNames) {
       const name = String(shortName ?? '').trim();
       if (name) {
@@ -424,11 +578,12 @@ async function fetchStandardEmojiCatalog() {
     }
   }
   const names = Array.from(assetUrls.keys()).sort((a, b) => a.localeCompare(b));
-  return { names, assetUrls };
+  return { names, assetUrls, categories: [{ name: 'default', names }] };
 }
 
 function mergeCatalogs(...catalogs) {
   const assetUrls = new Map();
+  const hasSlackCategories = catalogs.some((catalog) => catalog?.hasSlackCategories);
   for (const catalog of catalogs) {
     if (!catalog?.assetUrls) {
       continue;
@@ -437,8 +592,46 @@ function mergeCatalogs(...catalogs) {
       assetUrls.set(name, url);
     }
   }
-  const names = Array.from(assetUrls.keys()).sort((a, b) => a.localeCompare(b));
-  return { names, assetUrls };
+
+  const categorized = new Set();
+  const categories = [];
+  for (const catalog of catalogs) {
+    if (!catalog?.categories || (hasSlackCategories && !catalog.hasSlackCategories)) {
+      continue;
+    }
+    for (const category of catalog.categories) {
+      const names = [];
+      for (const name of uniqueNames(category.names)) {
+        if (assetUrls.has(name) && !categorized.has(name)) {
+          categorized.add(name);
+          names.push(name);
+        }
+      }
+      if (names.length > 0) {
+        categories.push({ name: normalizeCategoryName(category.name), names });
+      }
+    }
+  }
+
+  const uncategorized = Array.from(assetUrls.keys())
+    .filter((name) => !categorized.has(name))
+    .sort((a, b) => a.localeCompare(b));
+  if (uncategorized.length > 0) {
+    categories.push({ name: hasSlackCategories ? 'default' : 'emoji', names: uncategorized });
+  }
+
+  const names = categories.flatMap((category) => category.names);
+  return { names, assetUrls, categories };
+}
+
+function serializeGalleryEntries(categories) {
+  const lines = [];
+  for (const category of categories) {
+    for (const name of category.names) {
+      lines.push(`${category.name}\t${name}`);
+    }
+  }
+  return lines.join('\n');
 }
 
 function applyMergedCatalog(state) {
@@ -446,10 +639,13 @@ function applyMergedCatalog(state) {
   state.assetUrls = merged.assetUrls;
   state.assetCache.clear();
   state.failedEmojiNames.clear();
+  state.decodedEmojiNames.clear();
+  state.preloadingEmojiNames.clear();
   state.currentEmojiName = '';
   state.loadedEmojiName = '';
   state.currentRequestId += 1;
-  state.wasm.set_gallery_entries(merged.names.join('\n'));
+  state.wasm.clear_decoded_emoji_texture_cache();
+  state.wasm.set_gallery_entries(serializeGalleryEntries(merged.categories));
   state.wasm.clear_active_emoji_texture();
   return merged;
 }
@@ -470,9 +666,12 @@ function showModeChoice(state, status = 'SELECT EMOJI MODE') {
   state.assetUrls = new Map();
   state.assetCache.clear();
   state.failedEmojiNames.clear();
+  state.decodedEmojiNames.clear();
+  state.preloadingEmojiNames.clear();
   state.currentEmojiName = '';
   state.loadedEmojiName = '';
   state.currentRequestId += 1;
+  state.wasm.clear_decoded_emoji_texture_cache();
   state.wasm.set_gallery_entries('');
   state.wasm.clear_active_emoji_texture();
   applyUiState(state, {
@@ -490,6 +689,7 @@ function enableDefaultEmojiMode(state) {
   state.modeSelected = true;
   state.workspaceCatalog = { names: [], assetUrls: new Map() };
   const merged = applyMergedCatalog(state);
+  applyRouteToWasm(state);
   applyUiState(state, {
     status: merged.names.length > 0 ? `LOADED ${merged.names.length} DEFAULT EMOJI` : 'DEFAULT EMOJI UNAVAILABLE',
     hint: state.config.clientId ? 'Press F2 to add workspace emoji with Slack.' : '',
@@ -538,6 +738,16 @@ async function fetchEmojiBytes(url, signal) {
   return bytes;
 }
 
+function waitForIdle(timeout = 500) {
+  return new Promise((resolve) => {
+    if ('requestIdleCallback' in window) {
+      window.requestIdleCallback(() => resolve(), { timeout });
+    } else {
+      window.setTimeout(resolve, 0);
+    }
+  });
+}
+
 function installStorageSync(state) {
   window.addEventListener('storage', async (event) => {
     if (event.key !== SESSION_KEY) {
@@ -572,12 +782,17 @@ export async function bootHostedEmojiApp(wasm) {
     workspaceCatalog: { names: [], assetUrls: new Map() },
     assetCache: createByteCache(ASSET_CACHE_MAX_BYTES),
     failedEmojiNames: new Set(),
+    decodedEmojiNames: new Set(),
+    preloadingEmojiNames: new Set(),
     activeAssetAbortController: null,
     currentEmojiName: '',
     loadedEmojiName: '',
     currentRequestId: 0,
     modeSelected: Boolean(loadSession()),
     signOutRequestSeen: 0,
+    lastAppliedRouteSignature: '',
+    lastWasmRouteSignature: '',
+    autoLoginStarted: false,
     ui: {
       status: '',
       workspace: '',
@@ -593,8 +808,8 @@ export async function bootHostedEmojiApp(wasm) {
     hasSession: Boolean(state.session),
   });
 
-  const openLoginTab = async () => {
-    let popup = null;
+  const startLogin = async ({ popup: usePopup = true } = {}) => {
+    let popupWindow = null;
     try {
       if (!config.clientId) {
         applyUiState(state, {
@@ -607,8 +822,11 @@ export async function bootHostedEmojiApp(wasm) {
         });
         return;
       }
-      popup = window.open('', '_blank');
-      if (!popup) {
+      const returnUrl = currentReturnUrl();
+      if (usePopup) {
+        popupWindow = window.open('', '_blank');
+      }
+      if (usePopup && !popupWindow) {
         applyUiState(state, {
           status: 'POPUP BLOCKED',
           hint: 'Allow popups for this site, then press ENTER again.',
@@ -621,13 +839,18 @@ export async function bootHostedEmojiApp(wasm) {
         return;
       }
       try {
-        popup.document.write(`<!doctype html><html><head><title>Slack Login</title><style>html,body{height:100%;margin:0}body{display:flex;align-items:center;justify-content:center;background:#0c121c;color:#d6e8ff;font:16px monospace}</style></head><body>Connecting to Slack...</body></html>`);
-        popup.document.close();
+        popupWindow?.document.write(`<!doctype html><html><head><title>Slack Login</title><style>html,body{height:100%;margin:0}body{display:flex;align-items:center;justify-content:center;background:#0c121c;color:#d6e8ff;font:16px monospace}</style></head><body>Connecting to Slack...</body></html>`);
+        popupWindow?.document.close();
       } catch {}
-      const loginUrl = await buildPkceLoginUrl(config);
-      log('opening slack login tab', { loginUrl });
+      const loginUrl = await buildPkceLoginUrl(config, returnUrl);
+      log(usePopup ? 'opening slack login tab' : 'redirecting to slack login', { loginUrl, returnUrl });
       state.modeSelected = true;
-      popup.location.href = loginUrl;
+      if (popupWindow) {
+        popupWindow.location.href = loginUrl;
+      } else {
+        window.location.assign(loginUrl);
+        return;
+      }
       applyUiState(state, {
         status: 'OPENED SLACK LOGIN',
         hint: 'Complete sign-in in the new tab. This window will update automatically.',
@@ -639,7 +862,7 @@ export async function bootHostedEmojiApp(wasm) {
       });
     } catch (error) {
       try {
-        popup?.close();
+        popupWindow?.close();
       } catch {}
       applyUiState(state, {
         status: 'UNABLE TO START SLACK SIGN-IN',
@@ -652,6 +875,8 @@ export async function bootHostedEmojiApp(wasm) {
       });
     }
   };
+
+  const openLoginTab = () => startLogin({ popup: true });
 
   const signOut = () => {
     log('signing out');
@@ -698,6 +923,9 @@ export async function bootHostedEmojiApp(wasm) {
   });
 
   installStorageSync(state);
+  window.addEventListener('popstate', () => {
+    applyRouteToWasm(state);
+  });
 
   try {
     applyUiState(state, {
@@ -712,12 +940,14 @@ export async function bootHostedEmojiApp(wasm) {
     const standardCatalog = await fetchStandardEmojiCatalog();
     log('standard emoji catalog loaded', { count: standardCatalog.names.length });
     state.standardCatalog = standardCatalog;
+    const initialRoute = applyRouteToWasm(state);
 
     if (config.clientId) {
       const callbackSession = await maybeHandleOAuthCallback(config);
       if (callbackSession) {
         state.session = callbackSession;
         state.modeSelected = true;
+        applyRouteToWasm(state);
         if (window.opener && window.opener !== window) {
           applyUiState(state, {
             status: 'LOGIN COMPLETE',
@@ -747,6 +977,17 @@ export async function bootHostedEmojiApp(wasm) {
       state.session = await ensureFreshSession(config, state.session);
       log('session ready', { team: state.session?.team?.name ?? '' });
       await syncCatalog(state);
+    } else if (initialRoute.emojiName && config.clientId && !state.autoLoginStarted) {
+      state.autoLoginStarted = true;
+      applyUiState(state, {
+        status: 'SLACK SIGN-IN REQUIRED',
+        hint: 'Redirecting to Slack to open this emoji preview.',
+        signedIn: false,
+        busy: true,
+        loginEnabled: true,
+        catalogReady: false,
+      });
+      await startLogin({ popup: false });
     } else {
       log('no session available after boot');
       showModeChoice(state);
@@ -786,6 +1027,7 @@ export async function bootHostedEmojiApp(wasm) {
         return;
       }
       const name = wasm.current_emoji_name();
+      syncUrlFromWasm(state);
       if (name !== state.currentEmojiName) {
         log('current emoji changed', { from: state.currentEmojiName, to: name });
         state.currentEmojiName = name;
@@ -794,6 +1036,7 @@ export async function bootHostedEmojiApp(wasm) {
         log('emoji asset out of sync', { selected: name, loaded: state.loadedEmojiName });
         await ensureEmojiTexture(state, name);
       }
+      preloadPreviewNeighbors(state);
     } catch (error) {
       console.error('[ultramoji-viewer-4d] tick failed', error);
       if (state.session) {
@@ -831,6 +1074,7 @@ async function syncCatalog(state) {
   log('emoji catalog loaded', { count: catalog.names.length });
   state.workspaceCatalog = catalog;
   const merged = applyMergedCatalog(state);
+  applyRouteToWasm(state);
   applyUiState(state, {
     status: `LOADED ${merged.names.length} EMOJI`,
     workspace: state.session?.team?.name || '',
@@ -848,6 +1092,14 @@ async function ensureEmojiTexture(state, name) {
     log('clearing emoji texture because name is empty');
     state.wasm.clear_active_emoji_texture();
     state.loadedEmojiName = '';
+    return;
+  }
+  if (state.wasm.set_active_emoji_texture_from_cache(name)) {
+    log('using predecoded emoji texture', { name });
+    state.failedEmojiNames.delete(name);
+    state.decodedEmojiNames.add(name);
+    state.loadedEmojiName = name;
+    applyPreviewReadyState(state);
     return;
   }
   const url = state.assetUrls.get(name);
@@ -870,7 +1122,9 @@ async function ensureEmojiTexture(state, name) {
       log('cached emoji decode handoff', { name, ok });
       if (ok) {
         state.failedEmojiNames.delete(name);
+        state.decodedEmojiNames.add(name);
         state.loadedEmojiName = name;
+        applyPreviewReadyState(state);
       }
     }
     return;
@@ -916,7 +1170,12 @@ async function ensureEmojiTexture(state, name) {
     return;
   }
   state.failedEmojiNames.delete(name);
+  state.decodedEmojiNames.add(name);
   state.loadedEmojiName = name;
+  applyPreviewReadyState(state);
+}
+
+function applyPreviewReadyState(state) {
   applyUiState(state, {
     workspace: state.session?.team?.name || '',
     hint: 'Preview ready.',
@@ -925,4 +1184,54 @@ async function ensureEmojiTexture(state, name) {
     loginEnabled: Boolean(state.config.clientId),
     catalogReady: state.assetUrls.size > 0,
   });
+}
+
+function preloadPreviewNeighbors(state) {
+  if (!state.currentEmojiName) {
+    return;
+  }
+  for (const name of [
+    state.wasm.previous_preview_emoji_name(),
+    state.wasm.next_preview_emoji_name(),
+  ]) {
+    if (name) {
+      void preloadEmojiTexture(state, name);
+    }
+  }
+}
+
+async function preloadEmojiTexture(state, name) {
+  if (
+    !name
+    || state.decodedEmojiNames.has(name)
+    || state.preloadingEmojiNames.has(name)
+    || state.failedEmojiNames.has(name)
+  ) {
+    return;
+  }
+  const url = state.assetUrls.get(name);
+  if (!url) {
+    return;
+  }
+
+  state.preloadingEmojiNames.add(name);
+  try {
+    let bytes;
+    if (state.assetCache.has(url)) {
+      bytes = state.assetCache.get(url);
+    } else {
+      bytes = await fetchEmojiBytes(url);
+      state.assetCache.set(url, bytes);
+    }
+    await waitForIdle();
+    const decoded = state.wasm.preload_emoji_texture_bytes(name, bytes);
+    log('preloaded emoji texture', { name, decoded });
+    if (decoded) {
+      state.decodedEmojiNames.add(name);
+    }
+  } catch (error) {
+    log('emoji preload failed', { name, error: String(error?.message || error) });
+  } finally {
+    state.preloadingEmojiNames.delete(name);
+  }
 }

@@ -1,7 +1,7 @@
 use std::num::NonZeroU32;
 use std::path::Path;
-use std::sync::mpsc;
 use std::sync::Arc;
+use std::sync::mpsc;
 
 use anyhow::{Context, Result, anyhow};
 use softbuffer::{Context as SoftbufferContext, Surface as SoftbufferSurface};
@@ -22,9 +22,7 @@ mod preview {
     }
 }
 
-use preview::common::{
-    COLOR_SOURCE_ALPHA_THRESHOLD, Texture, fill_transparent_rgb_from_nearest,
-};
+use preview::common::{COLOR_SOURCE_ALPHA_THRESHOLD, Texture, fill_transparent_rgb_from_nearest};
 
 fn main() -> Result<()> {
     ensure_linux_gui_runtime_env()?;
@@ -150,7 +148,6 @@ fn ensure_linux_gui_runtime_env() -> Result<()> {
     Ok(())
 }
 
-
 struct LoadedImage {
     pixels: Vec<[u8; 4]>,
     width: u32,
@@ -259,11 +256,7 @@ fn extract_contours(
     for contour in contours {
         let (multi_polygon, _) = contour.into_inner();
         for polygon in &multi_polygon.0 {
-            let ext: Vec<[f64; 2]> = polygon
-                .exterior()
-                .coords()
-                .map(|c| [c.x, c.y])
-                .collect();
+            let ext: Vec<[f64; 2]> = polygon.exterior().coords().map(|c| [c.x, c.y]).collect();
             if ext.len() >= 3 {
                 rings.push(ext);
             }
@@ -278,11 +271,7 @@ fn extract_contours(
     rings
 }
 
-fn rasterize_contour_mask(
-    contours: &[Vec<[f64; 2]>],
-    width: usize,
-    height: usize,
-) -> Vec<bool> {
+fn rasterize_contour_mask(contours: &[Vec<[f64; 2]>], width: usize, height: usize) -> Vec<bool> {
     let mut mask = vec![false; width * height];
     for py in 0..height {
         let y = py as f64 / height as f64;
@@ -474,7 +463,11 @@ fn render_frame(
         ),
     ];
     for (i, line) in hud.iter().enumerate() {
-        let color = if i == 1 && computing { 0xFFAA00 } else { 0xFFFFFF };
+        let color = if i == 1 && computing {
+            0xFFAA00
+        } else {
+            0xFFFFFF
+        };
         draw_text_simple(&mut fb, out_w, out_h, 10, 10 + i * 14, line, color);
     }
 
@@ -524,7 +517,6 @@ fn draw_slider(
     }
 }
 
-
 fn draw_line(fb: &mut [u32], w: usize, h: usize, x0: f64, y0: f64, x1: f64, y1: f64, color: u32) {
     let dx = x1 - x0;
     let dy = y1 - y0;
@@ -542,7 +534,15 @@ fn draw_line(fb: &mut [u32], w: usize, h: usize, x0: f64, y0: f64, x1: f64, y1: 
     }
 }
 
-fn draw_text_simple(fb: &mut [u32], w: usize, h: usize, x: usize, y: usize, text: &str, color: u32) {
+fn draw_text_simple(
+    fb: &mut [u32],
+    w: usize,
+    h: usize,
+    x: usize,
+    y: usize,
+    text: &str,
+    color: u32,
+) {
     let mut cx = x;
     for ch in text.chars() {
         let glyph = glyph_pattern(ch);
@@ -651,8 +651,7 @@ impl ContourWorker {
                 while let Ok(newer) = request_rx.try_recv() {
                     latest = newer;
                 }
-                let rings =
-                    extract_contours(&image, latest.max_cells, latest.alpha_threshold);
+                let rings = extract_contours(&image, latest.max_cells, latest.alpha_threshold);
                 let aspect = image.width as f64 / image.height.max(1) as f64;
                 let (mask_w, mask_h) = if aspect >= 1.0 {
                     (MASK_SIZE, (MASK_SIZE as f64 / aspect).max(1.0) as usize)
@@ -704,7 +703,10 @@ struct App {
     params: ContourParams,
     worker: ContourWorker,
     window: Option<Arc<Window>>,
-    surface: Option<(SoftbufferContext<Arc<Window>>, SoftbufferSurface<Arc<Window>, Arc<Window>>)>,
+    surface: Option<(
+        SoftbufferContext<Arc<Window>>,
+        SoftbufferSurface<Arc<Window>, Arc<Window>>,
+    )>,
     window_id: Option<WindowId>,
     show_contour: bool,
     show_bfs_fill: bool,

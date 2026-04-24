@@ -17,7 +17,7 @@
 <body>
 <div id="loading">Initializing WebGPU...</div>
 <canvas id="emoji-canvas"></canvas>
-<script src="./slack-config.js"></script>
+<script src="/slack-config.js"></script>
 <script type="module">
 const loadingEl = document.getElementById('loading');
 const DEFAULT_ASSET_MANIFEST = {
@@ -37,7 +37,7 @@ function showStartupError(message) {
 
 async function loadAssetManifest() {
   try {
-    const response = await fetch('./asset-manifest.json', {
+    const response = await fetch('/asset-manifest.json', {
       cache: 'no-store',
       credentials: 'same-origin',
     });
@@ -50,7 +50,7 @@ async function loadAssetManifest() {
 
 function versionedAssetUrl(manifest, path) {
   const version = manifest[path];
-  return version ? `./${path}?v=${encodeURIComponent(version)}` : `./${path}`;
+  return version ? `/${path}?v=${encodeURIComponent(version)}` : `/${path}`;
 }
 
 function chooseRenderConfigDefaults() {
@@ -62,7 +62,7 @@ function chooseRenderConfigDefaults() {
     galleryCanvasScale: highDpr || lowMemory ? 0.75 : 1.0,
     previewCanvasScale: highDpr || lowMemory ? 0.75 : 1.0,
     previewMaxDim: lowMemory ? 256 : 320,
-    previewRenderScale: lowMemory ? 1.25 : 1.5,
+    previewRenderScale: 2.0,
     displayPixelated: false,
     overlayFilter: false,
   };
@@ -76,14 +76,23 @@ try {
   const {
     default: init,
     clear_active_emoji_texture,
+    clear_decoded_emoji_texture_cache,
     current_emoji_name,
+    current_preview_emoji_name,
+    current_search_query,
+    next_preview_emoji_name,
+    preload_emoji_texture_bytes,
+    previous_preview_emoji_name,
     set_active_emoji_texture_error,
+    set_active_emoji_texture_from_cache,
     sign_out_request_nonce,
     set_active_emoji_texture_bytes,
     set_gallery_entries,
     set_hosted_auth_state,
     set_perf_toggles,
     set_render_config,
+    set_shadow_render_config,
+    set_route_state,
     set_transfer_tuning,
   } = wasmModule;
   await init(versionedAssetUrl(assetManifest, 'pkg/emoji_web_bg.wasm'));
@@ -119,6 +128,15 @@ try {
         overlayFilter,
       );
     },
+    setShadow({
+      mode = 1,
+      strength = 1.0,
+      maxDarkness = 1.0,
+      bins = 96,
+      resolution = 256,
+    } = {}) {
+      set_shadow_render_config(mode, strength, maxDarkness, bins, resolution);
+    },
     setTransfer({
       linearGain = 1.15,
       gamma = 1.0,
@@ -131,12 +149,20 @@ try {
 
   await bootHostedEmojiApp({
     clear_active_emoji_texture,
+    clear_decoded_emoji_texture_cache,
     current_emoji_name,
+    current_preview_emoji_name,
+    current_search_query,
+    next_preview_emoji_name,
+    preload_emoji_texture_bytes,
+    previous_preview_emoji_name,
     set_active_emoji_texture_error,
+    set_active_emoji_texture_from_cache,
     sign_out_request_nonce,
     set_active_emoji_texture_bytes,
     set_gallery_entries,
     set_hosted_auth_state,
+    set_route_state,
   });
 } catch (err) {
   console.error('startup failed', err);

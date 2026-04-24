@@ -220,7 +220,9 @@ fn parse_backend(value: &str) -> Result<BackendChoice> {
 }
 
 fn print_help() {
-    eprintln!("emoji_preview_viewer [--backend auto|x11|wayland] [--bg HEXCOLOR] [--smoke-test] [IMAGE]");
+    eprintln!(
+        "emoji_preview_viewer [--backend auto|x11|wayland] [--bg HEXCOLOR] [--smoke-test] [IMAGE]"
+    );
     eprintln!("  IMAGE defaults to 'demo' and may be a PNG/GIF path.");
     eprintln!("  --bg sets the background/floor color (e.g. --bg 1a1a2e)");
 }
@@ -615,9 +617,11 @@ impl ApplicationHandler for ViewerApp {
                 let Some(viewer) = &mut self.viewer else {
                     return;
                 };
-                if let Err(err) =
-                    viewer.render(&self.image, self.start.elapsed().as_millis() as u64, &self.sliders)
-                {
+                if let Err(err) = viewer.render(
+                    &self.image,
+                    self.start.elapsed().as_millis() as u64,
+                    &self.sliders,
+                ) {
                     self.fail_or_headless(event_loop, err.context("render failed"));
                     return;
                 }
@@ -930,7 +934,12 @@ impl Viewer {
         }
     }
 
-    fn render(&mut self, image: &LoadedImage, elapsed_ms: u64, sliders: &SliderState) -> Result<()> {
+    fn render(
+        &mut self,
+        image: &LoadedImage,
+        elapsed_ms: u64,
+        sliders: &SliderState,
+    ) -> Result<()> {
         let frame_start = Instant::now();
         if let Some(last) = self.perf.last_frame_start.replace(frame_start) {
             let frame_ms = frame_start.duration_since(last).as_secs_f64() * 1000.0;
@@ -954,7 +963,8 @@ impl Viewer {
 
         if self.show_tui_mode {
             let tui_cols = 140usize;
-            let tui_rows = (tui_cols as f32 / (out_w as f32 / out_h as f32) / 2.0).max(1.0) as usize;
+            let tui_rows =
+                (tui_cols as f32 / (out_w as f32 / out_h as f32) / 2.0).max(1.0) as usize;
             let tui_px_w = tui_cols;
             let tui_px_h = tui_rows * 2;
 
@@ -981,9 +991,8 @@ impl Viewer {
                     ("GPU/TUI", tui_px_w, tui_px_h, rgb)
                 }
                 Presenter::Cpu(_) => {
-                    let rgb = preview::cpu::render_billboard_rgb(
-                        &texture, tui_px_w, tui_px_h, time_secs,
-                    );
+                    let rgb =
+                        preview::cpu::render_billboard_rgb(&texture, tui_px_w, tui_px_h, time_secs);
                     ("CPU/TUI", tui_px_w, tui_px_h, rgb)
                 }
             };
@@ -1032,9 +1041,13 @@ impl Viewer {
 
         let time_secs = elapsed_ms as f64 / 1000.0;
         let (renderer_name, render_w, render_h) = match &mut self.presenter {
-            Presenter::Gpu(gpu) => {
-                gpu.render_scene(&texture, out_w as usize, out_h as usize, time_secs, &scene_params)?
-            }
+            Presenter::Gpu(gpu) => gpu.render_scene(
+                &texture,
+                out_w as usize,
+                out_h as usize,
+                time_secs,
+                &scene_params,
+            )?,
             Presenter::Cpu(_) => ("CPU", out_w as usize, out_h as usize),
         };
         let render_ms = frame_start.elapsed().as_secs_f64() * 1000.0;
@@ -1286,8 +1299,13 @@ impl GpuPresenter {
             out_h,
             self.renderer.max_texture_dimension_2d() as usize,
         );
-        self.renderer
-            .render_to_offscreen_params(texture, render_w as u32, render_h as u32, time_secs, params)?;
+        self.renderer.render_to_offscreen_params(
+            texture,
+            render_w as u32,
+            render_h as u32,
+            time_secs,
+            params,
+        )?;
         Ok(("GPU", render_w, render_h))
     }
 
@@ -1404,7 +1422,13 @@ impl GpuPresenter {
         Ok(())
     }
 
-    fn present_rgb_fb(&mut self, fb: &[(u8, u8, u8)], overlay: &PerfOverlay<'_>, out_w: u32, out_h: u32) -> Result<()> {
+    fn present_rgb_fb(
+        &mut self,
+        fb: &[(u8, u8, u8)],
+        overlay: &PerfOverlay<'_>,
+        out_w: u32,
+        out_h: u32,
+    ) -> Result<()> {
         let w = out_w as usize;
         let h = out_h as usize;
         let mut rgba = Vec::with_capacity(w * h * 4);
@@ -1413,7 +1437,8 @@ impl GpuPresenter {
                 rgba.extend_from_slice(&[r, g, b, 255]);
             }
         }
-        self.renderer.write_to_postprocess_output(&rgba, out_w, out_h);
+        self.renderer
+            .write_to_postprocess_output(&rgba, out_w, out_h);
         self.present(overlay, out_w, out_h)
     }
 
@@ -1578,20 +1603,22 @@ fn perf_overlay_lines(overlay: &PerfOverlay<'_>) -> Vec<String> {
         ),
         format!(
             "STENCIL {}",
-            if overlay.show_stencil_shadow { "ON" } else { "OFF" }
+            if overlay.show_stencil_shadow {
+                "ON"
+            } else {
+                "OFF"
+            }
         ),
-        format!(
-            "TUI {}",
-            if overlay.show_tui_mode { "ON" } else { "OFF" }
-        ),
-        format!(
-            "DEPTH {}",
-            if overlay.show_depth { "ON" } else { "OFF" }
-        ),
+        format!("TUI {}", if overlay.show_tui_mode { "ON" } else { "OFF" }),
+        format!("DEPTH {}", if overlay.show_depth { "ON" } else { "OFF" }),
         String::new(),
     ];
     for (i, (name, value, _, _, _)) in overlay.sliders.sliders().iter().enumerate() {
-        let marker = if i == overlay.sliders.active { ">" } else { " " };
+        let marker = if i == overlay.sliders.active {
+            ">"
+        } else {
+            " "
+        };
         lines.push(format!("{}{} {:.2}", marker, name, value));
     }
     lines.push(String::new());

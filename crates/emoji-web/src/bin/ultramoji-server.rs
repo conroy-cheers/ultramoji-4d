@@ -325,9 +325,24 @@ async fn resolve_static_path(
         .unwrap_or(false)
     {
         Some((path, None))
+    } else if is_spa_route(&decoded) {
+        let index_path = static_dir.join("index.html");
+        fs::metadata(&index_path)
+            .await
+            .map(|metadata| metadata.is_file())
+            .unwrap_or(false)
+            .then_some((index_path, None))
     } else {
         None
     }
+}
+
+fn is_spa_route(decoded_path: &str) -> bool {
+    let mut components = Path::new(decoded_path.trim_start_matches('/')).components();
+    matches!(
+        components.next(),
+        Some(Component::Normal(component)) if component == "emoji"
+    )
 }
 
 fn accepts_encoding(header: &str, encoding: &str) -> bool {

@@ -181,7 +181,10 @@ impl TerminalRenderer {
         });
 
         let uniform = RendererUniforms {
-            screen_size: [cell_w as f32 * TERM_COLS as f32, cell_h as f32 * TERM_ROWS as f32],
+            screen_size: [
+                cell_w as f32 * TERM_COLS as f32,
+                cell_h as f32 * TERM_ROWS as f32,
+            ],
             grid_size: [TERM_COLS as f32, TERM_ROWS as f32],
             cell_size: [cell_w as f32, cell_h as f32],
             _pad: [0.0; 2],
@@ -353,12 +356,7 @@ impl TerminalRenderer {
         &self.output_view
     }
 
-    pub fn render(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        grid: &TerminalGrid,
-    ) {
+    pub fn render(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, grid: &TerminalGrid) {
         let mut instances = Vec::with_capacity(grid.cells().len());
         for cell in grid.cells() {
             let glyph_idx = self
@@ -418,7 +416,12 @@ fn build_glyph_atlas(
     cell_w: u32,
     cell_h: u32,
     baseline: i32,
-) -> (HashMap<char, u16>, Vec<[f32; 4]>, wgpu::Texture, wgpu::TextureView) {
+) -> (
+    HashMap<char, u16>,
+    Vec<[f32; 4]>,
+    wgpu::Texture,
+    wgpu::TextureView,
+) {
     let glyphs: Vec<char> = (32u8..=126u8).map(|c| c as char).collect();
     let cols = 16u32;
     let rows = (glyphs.len() as u32).div_ceil(cols);
