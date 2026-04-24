@@ -62,6 +62,15 @@ fn luminance(c: vec3f) -> f32 {
     return dot(c, vec3f(0.299, 0.587, 0.114));
 }
 
+const AMBIENT_LIGHT_LUMINANCE: f32 = 0.35;
+const AMBIENT_LIGHT_FLOOR_BLEND: f32 = 0.25;
+
+fn ambient_light_color(bg_color: vec3f) -> vec3f {
+    let tint = mix(vec3f(1.0), bg_color, AMBIENT_LIGHT_FLOOR_BLEND);
+    let tint_luma = max(luminance(tint), 0.001);
+    return tint * (AMBIENT_LIGHT_LUMINANCE / tint_luma);
+}
+
 fn perturb_normal(geom_n: vec3f, uv: vec2f, face_type: u32) -> vec3f {
     let tex_size = vec2f(textureDimensions(tex));
     let texel = 1.0 / tex_size;
@@ -216,13 +225,14 @@ fn fs_main(in: VertexOutput) -> SceneOutput {
 
     let n = normalize(perturb_normal(geom_n, in.uv, in.face_type));
 
-    let ndotl = max(dot(n, light), 0.0);
+    let direct_facing = select(0.0, 1.0, dot(geom_n, light) > 0.0);
+    let ndotl = max(dot(n, light), 0.0) * direct_facing;
     let diffuse = ndotl * diff_strength;
 
     let reflect = 2.0 * dot(n, light) * n - light;
     let view = normalize(u.camera_pos.xyz);
     let lum = luminance(base_color.rgb);
-    let spec = pow(max(dot(reflect, view), 0.0), 32.0) * 0.2 * smoothstep(0.3, 0.8, lum);
+    let spec = pow(max(dot(reflect, view), 0.0), 32.0) * 0.2 * smoothstep(0.3, 0.8, lum) * direct_facing;
 
     var dark_factor = 1.0;
     if in.face_type >= 2u {
@@ -230,7 +240,8 @@ fn fs_main(in: VertexOutput) -> SceneOutput {
     }
 
     let direct_visibility = shadow_map_factor(in.light_position) * precomputed_shadow_factor(in.uv, in.face_type);
-    let rgb = base_color.rgb * dark_factor * (ambient + diffuse * direct_visibility) + vec3f(spec * direct_visibility);
+    let ambient_rgb = ambient_light_color(u.bg_color.rgb) * (ambient / AMBIENT_LIGHT_LUMINANCE);
+    let rgb = base_color.rgb * dark_factor * (ambient_rgb + vec3f(diffuse * direct_visibility)) + vec3f(spec * direct_visibility);
     var out: SceneOutput;
     out.color = vec4f(clamp(rgb, vec3f(0.0), vec3f(1.0)), base_color.a);
     out.depth = in.position.z;
@@ -355,13 +366,8 @@ struct SsaoParams {
     _pad1: f32,
 }
 
-const SHADOW_MAP_AMBIENT_LUMINANCE: f32 = 0.35;
-const SHADOW_AMBIENT_FLOOR_BLEND: f32 = 0.25;
-
 fn shadow_map_ambient_color() -> vec3f {
-    let tint = mix(vec3f(1.0), ssao_u.bg_color.rgb, SHADOW_AMBIENT_FLOOR_BLEND);
-    let tint_luma = max(luminance(tint), 0.001);
-    return tint * (SHADOW_MAP_AMBIENT_LUMINANCE / tint_luma);
+    return ambient_light_color(ssao_u.bg_color.rgb);
 }
 
 @group(0) @binding(0) var<uniform> ssao_u: Uniforms;
