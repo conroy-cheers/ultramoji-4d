@@ -3,9 +3,103 @@ const PKCE_KEY = 'ultramoji4d.emojiWeb.pkce.v1';
 const DEFAULT_REDIRECT = `${window.location.origin}${window.location.pathname}`;
 const STANDARD_EMOJI_DATA_URL = 'https://cdn.jsdelivr.net/gh/iamcal/emoji-data@master/emoji.json';
 const STANDARD_EMOJI_IMAGE_BASE_URL = 'https://cdn.jsdelivr.net/gh/jdecked/twemoji@15.1.0/assets/72x72';
+const ASSET_CACHE_MAX_BYTES = 16 * 1024 * 1024;
+const FETCH_MAX_BYTES = 8 * 1024 * 1024;
+const FETCH_TIMEOUT_MS = 20_000;
+const ACTIVE_POLL_MS = 100;
+const IDLE_POLL_MS = 1_000;
+
+function debugLogsEnabled() {
+  try {
+    return new URLSearchParams(window.location.search).has('debug')
+      || localStorage.getItem('ultramoji4d.debug') === '1';
+  } catch {
+    return false;
+  }
+}
+
+const DEBUG_LOGS = debugLogsEnabled();
 
 function log(...args) {
+  if (!DEBUG_LOGS) return;
   console.log('[ultramoji-viewer-4d]', ...args);
+}
+
+function createByteCache(maxBytes) {
+  let totalBytes = 0;
+  const entries = new Map();
+  return {
+    clear() {
+      totalBytes = 0;
+      entries.clear();
+    },
+    has(key) {
+      return entries.has(key);
+    },
+    get(key) {
+      const entry = entries.get(key);
+      if (!entry) return undefined;
+      entries.delete(key);
+      entries.set(key, entry);
+      return entry.bytes;
+    },
+    set(key, bytes) {
+      const size = bytes?.byteLength ?? 0;
+      const previous = entries.get(key);
+      if (previous) {
+        totalBytes -= previous.size;
+        entries.delete(key);
+      }
+      if (size > maxBytes) {
+        return false;
+      }
+      entries.set(key, { bytes, size });
+      totalBytes += size;
+      while (totalBytes > maxBytes) {
+        const oldestKey = entries.keys().next().value;
+        if (oldestKey === undefined) break;
+        const oldest = entries.get(oldestKey);
+        totalBytes -= oldest?.size ?? 0;
+        entries.delete(oldestKey);
+      }
+      return true;
+    },
+    bytesUsed() {
+      return totalBytes;
+    },
+  };
+}
+
+async function fetchBytesWithLimit(url, options = {}) {
+  const timeoutController = new AbortController();
+  const timeoutId = window.setTimeout(() => timeoutController.abort(), FETCH_TIMEOUT_MS);
+  if (options.signal) {
+    if (options.signal.aborted) {
+      timeoutController.abort();
+    } else {
+      options.signal.addEventListener('abort', () => timeoutController.abort(), { once: true });
+    }
+  }
+  try {
+    const response = await fetch(url, {
+      ...options,
+      signal: timeoutController.signal,
+    });
+    if (!response.ok) {
+      throw new Error(`Emoji fetch failed: ${response.status} ${response.statusText}`);
+    }
+    const contentLength = Number(response.headers.get('content-length') || 0);
+    if (contentLength > FETCH_MAX_BYTES) {
+      throw new Error(`Emoji asset is too large (${contentLength} bytes)`);
+    }
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    if (bytes.byteLength > FETCH_MAX_BYTES) {
+      throw new Error(`Emoji asset is too large (${bytes.byteLength} bytes)`);
+    }
+    return bytes;
+  } finally {
+    window.clearTimeout(timeoutId);
+  }
 }
 
 function canonicalizeStandardUnified(unified) {
@@ -419,18 +513,15 @@ function isSlackAssetUrl(rawUrl) {
   }
 }
 
-async function fetchEmojiBytes(url) {
+async function fetchEmojiBytes(url, signal) {
   if (!isSlackAssetUrl(url)) {
     log('fetching public emoji bytes', { sourceUrl: url });
-    const response = await fetch(url, {
+    const bytes = await fetchBytesWithLimit(url, {
       method: 'GET',
       mode: 'cors',
       credentials: 'omit',
+      signal,
     });
-    if (!response.ok) {
-      throw new Error(`Emoji fetch failed: ${response.status} ${response.statusText}`);
-    }
-    const bytes = new Uint8Array(await response.arrayBuffer());
     log('public emoji bytes fetched', { sourceUrl: url, byteLength: bytes.byteLength });
     return bytes;
   }
@@ -438,11 +529,11 @@ async function fetchEmojiBytes(url) {
   const relayUrl = new URL('/emoji-asset', window.location.origin);
   relayUrl.searchParams.set('url', url);
   log('fetching emoji bytes', { relayUrl: relayUrl.toString(), sourceUrl: url });
-  const response = await fetch(relayUrl, { method: 'GET', credentials: 'same-origin' });
-  if (!response.ok) {
-    throw new Error(`Emoji fetch failed: ${response.status} ${response.statusText}`);
-  }
-  const bytes = new Uint8Array(await response.arrayBuffer());
+  const bytes = await fetchBytesWithLimit(relayUrl, {
+    method: 'GET',
+    credentials: 'same-origin',
+    signal,
+  });
   log('emoji bytes fetched', { sourceUrl: url, byteLength: bytes.byteLength });
   return bytes;
 }
@@ -479,8 +570,9 @@ export async function bootHostedEmojiApp(wasm) {
     assetUrls: new Map(),
     standardCatalog: { names: [], assetUrls: new Map() },
     workspaceCatalog: { names: [], assetUrls: new Map() },
-    assetCache: new Map(),
+    assetCache: createByteCache(ASSET_CACHE_MAX_BYTES),
     failedEmojiNames: new Set(),
+    activeAssetAbortController: null,
     currentEmojiName: '',
     loadedEmojiName: '',
     currentRequestId: 0,
@@ -666,6 +758,14 @@ export async function bootHostedEmojiApp(wasm) {
     showModeChoice(state, 'SLACK SESSION FAILED');
   }
 
+  const scheduleTick = (delayMs) => {
+    window.setTimeout(() => {
+      window.requestAnimationFrame(() => {
+        void tick();
+      });
+    }, delayMs);
+  };
+
   const tick = async () => {
     try {
       const signOutNonce = wasm.sign_out_request_nonce();
@@ -682,9 +782,7 @@ export async function bootHostedEmojiApp(wasm) {
         if (state.loadedEmojiName) {
           state.loadedEmojiName = '';
         }
-        window.requestAnimationFrame(() => {
-          void tick();
-        });
+        scheduleTick(IDLE_POLL_MS);
         return;
       }
       const name = wasm.current_emoji_name();
@@ -709,13 +807,9 @@ export async function bootHostedEmojiApp(wasm) {
         });
       }
     }
-    window.requestAnimationFrame(() => {
-      void tick();
-    });
+    scheduleTick(ACTIVE_POLL_MS);
   };
-  window.requestAnimationFrame(() => {
-    void tick();
-  });
+  scheduleTick(0);
 }
 
 async function syncCatalog(state) {
@@ -791,8 +885,11 @@ async function ensureEmojiTexture(state, name) {
     catalogReady: state.assetUrls.size > 0,
   });
   let bytes;
+  state.activeAssetAbortController?.abort();
+  const abortController = new AbortController();
+  state.activeAssetAbortController = abortController;
   try {
-    bytes = await fetchEmojiBytes(url);
+    bytes = await fetchEmojiBytes(url, abortController.signal);
   } catch (error) {
     if (requestId === state.currentRequestId) {
       state.failedEmojiNames.add(name);
@@ -800,6 +897,10 @@ async function ensureEmojiTexture(state, name) {
       state.loadedEmojiName = name;
     }
     return;
+  } finally {
+    if (state.activeAssetAbortController === abortController) {
+      state.activeAssetAbortController = null;
+    }
   }
   state.assetCache.set(url, bytes);
   if (requestId !== state.currentRequestId) {

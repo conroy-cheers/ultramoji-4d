@@ -19,8 +19,12 @@
 <canvas id="emoji-canvas"></canvas>
 <script src="./slack-config.js"></script>
 <script type="module">
-const BUILD_TAG = '2026-04-23l';
 const loadingEl = document.getElementById('loading');
+const DEFAULT_ASSET_MANIFEST = {
+  'slack_hosted.js': '',
+  'pkg/emoji_web.js': '',
+  'pkg/emoji_web_bg.wasm': '',
+};
 
 function showStartupError(message) {
   if (!loadingEl) return;
@@ -31,10 +35,44 @@ function showStartupError(message) {
   loadingEl.style.whiteSpace = 'pre-wrap';
 }
 
+async function loadAssetManifest() {
+  try {
+    const response = await fetch('./asset-manifest.json', {
+      cache: 'no-store',
+      credentials: 'same-origin',
+    });
+    if (!response.ok) return DEFAULT_ASSET_MANIFEST;
+    return { ...DEFAULT_ASSET_MANIFEST, ...(await response.json()) };
+  } catch {
+    return DEFAULT_ASSET_MANIFEST;
+  }
+}
+
+function versionedAssetUrl(manifest, path) {
+  const version = manifest[path];
+  return version ? `./${path}?v=${encodeURIComponent(version)}` : `./${path}`;
+}
+
+function chooseRenderConfigDefaults() {
+  const dpr = Math.max(1, window.devicePixelRatio || 1);
+  const deviceMemory = Number(navigator.deviceMemory || 0);
+  const lowMemory = deviceMemory > 0 && deviceMemory <= 4;
+  const highDpr = dpr >= 1.75;
+  return {
+    galleryCanvasScale: highDpr || lowMemory ? 0.75 : 1.0,
+    previewCanvasScale: highDpr || lowMemory ? 0.75 : 1.0,
+    previewMaxDim: lowMemory ? 256 : 320,
+    previewRenderScale: lowMemory ? 1.25 : 1.5,
+    displayPixelated: false,
+    overlayFilter: false,
+  };
+}
+
 try {
-  const hostedModule = await import(`./slack_hosted.js?v=${BUILD_TAG}`);
+  const assetManifest = await loadAssetManifest();
+  const hostedModule = await import(versionedAssetUrl(assetManifest, 'slack_hosted.js'));
   const { bootHostedEmojiApp } = hostedModule;
-  const wasmModule = await import(`./pkg/emoji_web.js?v=${BUILD_TAG}`);
+  const wasmModule = await import(versionedAssetUrl(assetManifest, 'pkg/emoji_web.js'));
   const {
     default: init,
     clear_active_emoji_texture,
@@ -48,20 +86,29 @@ try {
     set_render_config,
     set_transfer_tuning,
   } = wasmModule;
-  await init(`./pkg/emoji_web_bg.wasm?v=${BUILD_TAG}`);
+  await init(versionedAssetUrl(assetManifest, 'pkg/emoji_web_bg.wasm'));
   loadingEl?.remove();
+  const defaultRenderConfig = chooseRenderConfigDefaults();
+  set_render_config(
+    defaultRenderConfig.galleryCanvasScale,
+    defaultRenderConfig.previewCanvasScale,
+    defaultRenderConfig.previewMaxDim,
+    defaultRenderConfig.previewRenderScale,
+    defaultRenderConfig.displayPixelated,
+    defaultRenderConfig.overlayFilter,
+  );
 
   window.__emojiPerfControls = {
     setToggles({ crt = true, transfer = true, overlayFilter = true, billboard = true } = {}) {
       set_perf_toggles(crt, transfer, overlayFilter, billboard);
     },
     setRenderConfig({
-      galleryCanvasScale = 1.0,
-      previewCanvasScale = 1.0,
-      previewMaxDim = 320,
-      previewRenderScale = 2.0,
-      displayPixelated = false,
-      overlayFilter = false,
+      galleryCanvasScale = defaultRenderConfig.galleryCanvasScale,
+      previewCanvasScale = defaultRenderConfig.previewCanvasScale,
+      previewMaxDim = defaultRenderConfig.previewMaxDim,
+      previewRenderScale = defaultRenderConfig.previewRenderScale,
+      displayPixelated = defaultRenderConfig.displayPixelated,
+      overlayFilter = defaultRenderConfig.overlayFilter,
     } = {}) {
       set_render_config(
         galleryCanvasScale,
