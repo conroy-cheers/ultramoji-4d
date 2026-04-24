@@ -2,7 +2,7 @@ const SESSION_KEY = 'ultramoji4d.emojiWeb.session.v1';
 const PKCE_KEY = 'ultramoji4d.emojiWeb.pkce.v1';
 const DEFAULT_REDIRECT = `${window.location.origin}${window.location.pathname}`;
 const STANDARD_EMOJI_DATA_URL = 'https://cdn.jsdelivr.net/gh/iamcal/emoji-data@master/emoji.json';
-const STANDARD_EMOJI_IMAGE_BASE_URL = 'https://cdn.jsdelivr.net/gh/jdecked/twemoji@15.1.0/assets/72x72';
+const STANDARD_EMOJI_IMAGE_BASE_URL = 'https://cdn.jsdelivr.net/gh/jdecked/twemoji@17.0.2/assets/72x72';
 const ASSET_CACHE_MAX_BYTES = 16 * 1024 * 1024;
 const FETCH_MAX_BYTES = 8 * 1024 * 1024;
 const FETCH_TIMEOUT_MS = 20_000;
@@ -103,12 +103,27 @@ async function fetchBytesWithLimit(url, options = {}) {
   }
 }
 
-function canonicalizeStandardUnified(unified) {
+function normalizeStandardUnifiedParts(unified) {
   return String(unified ?? '')
     .trim()
     .toLowerCase()
+    .replace(/\.png$/i, '')
     .split('-')
-    .filter((part) => part && part !== 'fe0f')
+    .filter(Boolean)
+    .map((part) => {
+      if (!/^[0-9a-f]+$/i.test(part)) {
+        return part;
+      }
+      const codepoint = Number.parseInt(part, 16);
+      return codepoint.toString(16);
+    });
+}
+
+export function canonicalizeStandardUnified(unified) {
+  const parts = normalizeStandardUnifiedParts(unified);
+  const hasZwj = parts.includes('200d');
+  return parts
+    .filter((part) => hasZwj || part !== 'fe0f')
     .join('-');
 }
 
@@ -118,12 +133,18 @@ function hasSkinToneModifier(unified) {
     .some((part) => SKIN_TONE_UNIFIED_PARTS.has(part));
 }
 
-function standardEmojiImageFilename(entry, unified) {
-  const image = String(entry?.image ?? '').trim().toLowerCase();
-  if (/^[0-9a-f-]+\.png$/i.test(image)) {
-    return image;
-  }
-  return `${unified}.png`;
+export function standardEmojiImageFilename(entry, unified) {
+  const image = String(entry?.image ?? '').trim();
+  const parts = normalizeStandardUnifiedParts(image || unified);
+  const hasZwj = parts.includes('200d');
+  return `${parts.filter((part) => hasZwj || part !== 'fe0f').join('-')}.png`;
+}
+
+export function standardEmojiImageFilenames(entry, unified) {
+  const image = String(entry?.image ?? '').trim();
+  const parts = normalizeStandardUnifiedParts(image || unified);
+  const strippedFilename = `${parts.filter((part) => part !== 'fe0f').join('-')}.png`;
+  return uniqueNames([standardEmojiImageFilename(entry, unified), strippedFilename]);
 }
 
 function readConfig() {
@@ -569,11 +590,12 @@ async function fetchStandardEmojiCatalog() {
     if (shortNames.length === 0) {
       continue;
     }
-    const url = `${STANDARD_EMOJI_IMAGE_BASE_URL}/${standardEmojiImageFilename(entry, unified)}`;
+    const urls = standardEmojiImageFilenames(entry, unified)
+      .map((filename) => `${STANDARD_EMOJI_IMAGE_BASE_URL}/${filename}`);
     for (const shortName of shortNames) {
       const name = String(shortName ?? '').trim();
       if (name) {
-        assetUrls.set(name, url);
+        assetUrls.set(name, urls.length === 1 ? urls[0] : urls);
       }
     }
   }
@@ -736,6 +758,39 @@ async function fetchEmojiBytes(url, signal) {
   });
   log('emoji bytes fetched', { sourceUrl: url, byteLength: bytes.byteLength });
   return bytes;
+}
+
+function emojiAssetUrls(value) {
+  if (Array.isArray(value)) {
+    return uniqueNames(value);
+  }
+  if (typeof value === 'string' && value) {
+    return [value];
+  }
+  return [];
+}
+
+function cachedEmojiBytes(assetCache, urls) {
+  for (const url of urls) {
+    if (assetCache.has(url)) {
+      return { url, bytes: assetCache.get(url) };
+    }
+  }
+  return null;
+}
+
+async function fetchFirstEmojiBytes(urls, signal) {
+  let lastError = null;
+  for (const url of urls) {
+    try {
+      const bytes = await fetchEmojiBytes(url, signal);
+      return { url, bytes };
+    } catch (error) {
+      lastError = error;
+      log('emoji bytes candidate failed', { sourceUrl: url, error: String(error?.message || error) });
+    }
+  }
+  throw lastError || new Error('No emoji asset URL candidates');
 }
 
 function waitForIdle(timeout = 500) {
@@ -1102,8 +1157,8 @@ async function ensureEmojiTexture(state, name) {
     applyPreviewReadyState(state);
     return;
   }
-  const url = state.assetUrls.get(name);
-  if (!url) {
+  const urls = emojiAssetUrls(state.assetUrls.get(name));
+  if (urls.length === 0) {
     log('no asset url for emoji', { name });
     state.failedEmojiNames.add(name);
     state.wasm.set_active_emoji_texture_error(name);
@@ -1115,10 +1170,12 @@ async function ensureEmojiTexture(state, name) {
     state.loadedEmojiName = name;
     return;
   }
-  if (state.assetCache.has(url)) {
+  const cached = cachedEmojiBytes(state.assetCache, urls);
+  if (cached) {
+    const { url, bytes } = cached;
     log('using cached emoji bytes', { name, url });
     if (requestId === state.currentRequestId) {
-      const ok = state.wasm.set_active_emoji_texture_bytes(name, state.assetCache.get(url));
+      const ok = state.wasm.set_active_emoji_texture_bytes(name, bytes);
       log('cached emoji decode handoff', { name, ok });
       if (ok) {
         state.failedEmojiNames.delete(name);
@@ -1132,18 +1189,19 @@ async function ensureEmojiTexture(state, name) {
 
   applyUiState(state, {
     workspace: state.session?.team?.name || '',
-    hint: `Fetching preview bytes for ${url}`,
+    hint: `Fetching preview bytes for ${urls[0]}`,
     signedIn: Boolean(state.session),
     busy: false,
     loginEnabled: Boolean(state.config.clientId),
     catalogReady: state.assetUrls.size > 0,
   });
   let bytes;
+  let url;
   state.activeAssetAbortController?.abort();
   const abortController = new AbortController();
   state.activeAssetAbortController = abortController;
   try {
-    bytes = await fetchEmojiBytes(url, abortController.signal);
+    ({ url, bytes } = await fetchFirstEmojiBytes(urls, abortController.signal));
   } catch (error) {
     if (requestId === state.currentRequestId) {
       state.failedEmojiNames.add(name);
@@ -1209,18 +1267,20 @@ async function preloadEmojiTexture(state, name) {
   ) {
     return;
   }
-  const url = state.assetUrls.get(name);
-  if (!url) {
+  const urls = emojiAssetUrls(state.assetUrls.get(name));
+  if (urls.length === 0) {
     return;
   }
 
   state.preloadingEmojiNames.add(name);
   try {
     let bytes;
-    if (state.assetCache.has(url)) {
-      bytes = state.assetCache.get(url);
+    let url;
+    const cached = cachedEmojiBytes(state.assetCache, urls);
+    if (cached) {
+      ({ url, bytes } = cached);
     } else {
-      bytes = await fetchEmojiBytes(url);
+      ({ url, bytes } = await fetchFirstEmojiBytes(urls));
       state.assetCache.set(url, bytes);
     }
     await waitForIdle();

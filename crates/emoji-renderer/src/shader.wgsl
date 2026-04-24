@@ -355,6 +355,15 @@ struct SsaoParams {
     _pad1: f32,
 }
 
+const SHADOW_MAP_AMBIENT_LUMINANCE: f32 = 0.35;
+const SHADOW_AMBIENT_FLOOR_BLEND: f32 = 0.25;
+
+fn shadow_map_ambient_color() -> vec3f {
+    let tint = mix(vec3f(1.0), ssao_u.bg_color.rgb, SHADOW_AMBIENT_FLOOR_BLEND);
+    let tint_luma = max(luminance(tint), 0.001);
+    return tint * (SHADOW_MAP_AMBIENT_LUMINANCE / tint_luma);
+}
+
 @group(0) @binding(0) var<uniform> ssao_u: Uniforms;
 @group(0) @binding(1) var ssao_color: texture_2d<f32>;
 @group(0) @binding(2) var ssao_linear_depth: texture_2d<f32>;
@@ -454,8 +463,10 @@ fn fs_ssao(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
         dist *= growth;
     }
 
-    let shadow = select(0.0, ssao_params.max_shadow, shadow_hit);
-    return vec4f(color.rgb * (1.0 - shadow * ssao_params.strength), color.a);
+    let shadow = select(0.0, 1.0, shadow_hit);
+    let shadow_amount = clamp(ssao_params.strength * ssao_params.max_shadow, 0.0, 1.0);
+    let shadowed_rgb = color.rgb * shadow_map_ambient_color();
+    return vec4f(mix(color.rgb, shadowed_rgb, shadow * shadow_amount), color.a);
 }
 
 struct PostprocessUniforms {

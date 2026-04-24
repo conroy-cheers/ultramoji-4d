@@ -20,6 +20,12 @@ mod terminal_renderer;
 use terminal_renderer::{TERM_COLS, TERM_ROWS, TerminalGrid, TerminalRenderer};
 
 const COMPOSITE_SHADER: &str = include_str!("composite.wgsl");
+const PREVIEW_DRAG_ROTATION_PER_PIXEL: f32 = -0.006;
+const PREVIEW_DRAG_MOMENTUM_DECAY_PER_SEC: f32 = 3.8;
+const PREVIEW_DRAG_MIN_VELOCITY: f32 = 0.02;
+const PREVIEW_DRAG_RELEASE_MIN_VELOCITY: f32 = 0.12;
+const PREVIEW_DRAG_RELEASE_MAX_STILL_SECS: f64 = 0.05;
+const PREVIEW_DRAG_VELOCITY_BLEND: f32 = 0.35;
 
 #[derive(Clone, Copy, PartialEq)]
 struct TransferTuning {
@@ -732,6 +738,14 @@ struct App {
     last_preview_overlay_visible: bool,
     preview_scene_time_origin_secs: f64,
     last_preview_reset_nonce: u32,
+    preview_manual_rotation: Option<f32>,
+    preview_dragging: bool,
+    preview_drag_last_x: f32,
+    preview_drag_last_time_secs: f64,
+    preview_drag_last_movement_time_secs: f64,
+    preview_drag_anchor_rotation: f32,
+    preview_rotation_velocity: f32,
+    last_billboard_canvas_rect: [f32; 4],
     smoothed_frame_cpu_ms: f32,
     smoothed_frame_interval_ms: f32,
     smoothed_surface_acquire_ms: f32,
@@ -928,6 +942,95 @@ impl App {
         SIGN_OUT_REQUEST_NONCE.with(|nonce| {
             *nonce.borrow_mut() = self.gallery.sign_out_request_nonce();
         });
+    }
+
+    fn reset_preview_drag_state(&mut self) {
+        self.preview_manual_rotation = None;
+        self.preview_dragging = false;
+        self.preview_drag_last_x = 0.0;
+        self.preview_drag_last_time_secs = 0.0;
+        self.preview_drag_last_movement_time_secs = 0.0;
+        self.preview_drag_anchor_rotation = 0.0;
+        self.preview_rotation_velocity = 0.0;
+    }
+
+    fn preview_scene_time_secs_at(&self, time_secs: f64) -> f64 {
+        if self.gallery.is_previewing() {
+            (time_secs - self.preview_scene_time_origin_secs).max(0.0)
+        } else {
+            time_secs
+        }
+    }
+
+    fn current_preview_scene_time_secs(&self) -> f64 {
+        let now = web_sys::window()
+            .and_then(|window| window.performance())
+            .map(|performance| performance.now())
+            .unwrap_or(0.0);
+        self.preview_scene_time_secs_at((now - self.start_time) / 1000.0)
+    }
+
+    fn automatic_preview_rotation(scene_time_secs: f64) -> f32 {
+        let phase = scene_time_secs * 0.8;
+        (phase - 0.6 * phase.sin()) as f32
+    }
+
+    fn event_time_secs(event: &MouseEvent) -> f64 {
+        event.time_stamp() / 1000.0
+    }
+
+    fn decay_preview_rotation_velocity(&mut self, dt_secs: f32) {
+        if self.preview_rotation_velocity.abs() <= PREVIEW_DRAG_MIN_VELOCITY {
+            self.preview_rotation_velocity = 0.0;
+            return;
+        }
+        self.preview_rotation_velocity *= (-PREVIEW_DRAG_MOMENTUM_DECAY_PER_SEC * dt_secs).exp();
+        if self.preview_rotation_velocity.abs() <= PREVIEW_DRAG_MIN_VELOCITY {
+            self.preview_rotation_velocity = 0.0;
+        }
+    }
+
+    fn record_preview_drag_sample(&mut self, surface_x: f32, event_time_secs: f64) {
+        let dx = surface_x - self.preview_drag_last_x;
+        let dt_secs = (event_time_secs - self.preview_drag_last_time_secs).max(0.001);
+        self.preview_drag_last_x = surface_x;
+        self.preview_drag_last_time_secs = event_time_secs;
+        if dx.abs() <= f32::EPSILON {
+            return;
+        }
+
+        let rotation_delta = dx * PREVIEW_DRAG_ROTATION_PER_PIXEL;
+        let rotation = self
+            .preview_manual_rotation
+            .unwrap_or(self.preview_drag_anchor_rotation);
+        self.preview_manual_rotation = Some(rotation + rotation_delta);
+
+        let sample_velocity = rotation_delta / dt_secs as f32;
+        self.preview_rotation_velocity = if self.preview_rotation_velocity.abs() <= f32::EPSILON {
+            sample_velocity
+        } else {
+            self.preview_rotation_velocity
+                + (sample_velocity - self.preview_rotation_velocity) * PREVIEW_DRAG_VELOCITY_BLEND
+        };
+        self.preview_drag_last_movement_time_secs = event_time_secs;
+    }
+
+    fn pointer_surface_pos(&self, event: &MouseEvent) -> [f32; 2] {
+        let client_w = self.canvas.client_width().max(1) as f32;
+        let client_h = self.canvas.client_height().max(1) as f32;
+        [
+            event.offset_x() as f32 / client_w * self.config.width.max(1) as f32,
+            event.offset_y() as f32 / client_h * self.config.height.max(1) as f32,
+        ]
+    }
+
+    fn point_in_rect(point: [f32; 2], rect: [f32; 4]) -> bool {
+        rect[2] > 0.0
+            && rect[3] > 0.0
+            && point[0] >= rect[0]
+            && point[0] <= rect[0] + rect[2]
+            && point[1] >= rect[1]
+            && point[1] <= rect[1] + rect[3]
     }
 
     fn current_preview_frame_index(&self, scene_time_secs: f64) -> Option<usize> {
@@ -1372,6 +1475,14 @@ impl App {
             last_preview_overlay_visible: false,
             preview_scene_time_origin_secs: 0.0,
             last_preview_reset_nonce: 0,
+            preview_manual_rotation: None,
+            preview_dragging: false,
+            preview_drag_last_x: 0.0,
+            preview_drag_last_time_secs: 0.0,
+            preview_drag_last_movement_time_secs: 0.0,
+            preview_drag_anchor_rotation: 0.0,
+            preview_rotation_velocity: 0.0,
+            last_billboard_canvas_rect: [0.0; 4],
             smoothed_frame_cpu_ms: 0.0,
             smoothed_frame_interval_ms: 0.0,
             smoothed_surface_acquire_ms: 0.0,
@@ -1443,6 +1554,12 @@ impl App {
             self.egui_pointer_pos = Some(pos);
             self.egui_pointer_moved = true;
         }
+        if self.preview_dragging {
+            event.prevent_default();
+            let surface_pos = self.pointer_surface_pos(&event);
+            let event_time_secs = Self::event_time_secs(&event);
+            self.record_preview_drag_sample(surface_pos[0], event_time_secs);
+        }
     }
 
     fn handle_mouse_leave(&mut self) {
@@ -1455,6 +1572,20 @@ impl App {
         self.egui_pointer_moved = true;
         self.egui_pointer_down = true;
         self.egui_pointer_pressed = true;
+        if !self.settings_visible && event.button() == 0 && self.gallery.is_previewing() {
+            let surface_pos = self.pointer_surface_pos(&event);
+            if Self::point_in_rect(surface_pos, self.last_billboard_canvas_rect) {
+                self.preview_dragging = true;
+                self.preview_drag_last_x = surface_pos[0];
+                self.preview_drag_last_time_secs = Self::event_time_secs(&event);
+                self.preview_drag_last_movement_time_secs = self.preview_drag_last_time_secs;
+                self.preview_rotation_velocity = 0.0;
+                self.preview_drag_anchor_rotation =
+                    self.preview_manual_rotation.unwrap_or_else(|| {
+                        Self::automatic_preview_rotation(self.current_preview_scene_time_secs())
+                    });
+            }
+        }
     }
 
     fn handle_mouse_up(&mut self, event: MouseEvent) {
@@ -1462,6 +1593,19 @@ impl App {
         self.egui_pointer_moved = true;
         self.egui_pointer_down = false;
         self.egui_pointer_released = true;
+        if self.preview_dragging {
+            let surface_pos = self.pointer_surface_pos(&event);
+            let event_time_secs = Self::event_time_secs(&event);
+            self.record_preview_drag_sample(surface_pos[0], event_time_secs);
+            let release_was_still = event_time_secs - self.preview_drag_last_movement_time_secs
+                > PREVIEW_DRAG_RELEASE_MAX_STILL_SECS;
+            if release_was_still
+                || self.preview_rotation_velocity.abs() < PREVIEW_DRAG_RELEASE_MIN_VELOCITY
+            {
+                self.preview_rotation_velocity = 0.0;
+            }
+        }
+        self.preview_dragging = false;
     }
 
     fn handle_wheel(&mut self, event: WheelEvent) {
@@ -1698,12 +1842,25 @@ impl App {
         if previewing && preview_reset_nonce != self.last_preview_reset_nonce {
             self.preview_scene_time_origin_secs = time_secs;
             self.last_preview_reset_nonce = preview_reset_nonce;
+            self.reset_preview_drag_state();
         }
         let preview_scene_time_secs = if previewing {
-            (time_secs - self.preview_scene_time_origin_secs).max(0.0)
+            self.preview_scene_time_secs_at(time_secs)
         } else {
             time_secs
         };
+        if previewing && self.preview_manual_rotation.is_some() {
+            if !self.preview_dragging
+                && self.preview_rotation_velocity.abs() > PREVIEW_DRAG_MIN_VELOCITY
+            {
+                let rotation = self.preview_manual_rotation.unwrap();
+                self.preview_manual_rotation =
+                    Some(rotation + self.preview_rotation_velocity * dt_secs as f32);
+                self.decay_preview_rotation_velocity(dt_secs as f32);
+            } else if !self.preview_dragging {
+                self.preview_rotation_velocity = 0.0;
+            }
+        }
         let terminal_cols = TERM_COLS as f32;
         let terminal_rows = TERM_ROWS as f32;
         let transfer = TRANSFER_TUNING.with(|t| *t.borrow());
@@ -1744,6 +1901,7 @@ impl App {
                     params.jitter = Some(0.1);
                     params.supersample = render_config.preview_render_scale > 1.01;
                     params.render_scale = Some(render_config.preview_render_scale);
+                    params.rotation = self.preview_manual_rotation;
                     params.ssao_strength = Some(render_config.shadow_strength);
                     params.ssao_depth_threshold = Some(render_config.shadow_depth_threshold);
                     params.ssao_start_dist = Some(render_config.shadow_start_dist);
@@ -1879,6 +2037,7 @@ impl App {
             billboard_pixel_rect[2] * sx,
             billboard_pixel_rect[3] * sy,
         ];
+        self.last_billboard_canvas_rect = billboard_canvas_rect;
 
         let uniforms = CompositeUniforms {
             output_size: [w as f32, h as f32],
