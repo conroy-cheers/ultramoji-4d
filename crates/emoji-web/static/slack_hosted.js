@@ -314,6 +314,271 @@ function applyUiState(state, fields) {
     workspace: state.ui.workspace,
   });
   pushUiState(state.wasm, state.ui);
+  state.updateKeypad?.();
+}
+
+const KEYPAD_BUTTONS = [
+  { slot: 'esc', key: 'Escape', label: 'Esc' },
+  { slot: 'up', key: 'ArrowUp', label: 'Up' },
+  { slot: 'pgup', key: 'PageUp', label: 'PgUp' },
+  { slot: 'left', key: 'ArrowLeft', label: 'Left' },
+  { slot: 'enter', key: 'Enter', label: 'Enter' },
+  { slot: 'right', key: 'ArrowRight', label: 'Right' },
+  { slot: 'f2', key: 'F2', label: 'F2', small: true },
+  { slot: 'd', key: 'd', label: 'D', small: true, hideWhenDisabled: true },
+  { slot: 'down', key: 'ArrowDown', label: 'Down' },
+  { slot: 'pgdn', key: 'PageDown', label: 'PgDn' },
+];
+
+function shouldShowMobileKeypad() {
+  const hasTouch = navigator.maxTouchPoints > 0;
+  const coarsePointer = window.matchMedia?.('(pointer: coarse)').matches ?? false;
+  const noHover = window.matchMedia?.('(hover: none)').matches ?? false;
+  const smallViewport = Math.min(window.innerWidth, window.innerHeight) <= 820;
+  const mobileUserAgent = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent || '');
+
+  return (hasTouch || coarsePointer || mobileUserAgent) && (noHover || smallViewport || mobileUserAgent);
+}
+
+function readKeypadMode(state) {
+  try {
+    return state.wasm.current_keypad_mode?.() || 'auth';
+  } catch {
+    return 'auth';
+  }
+}
+
+function keypadActionFor(def, state, mode) {
+  const search = state.wasm.current_search_query();
+  const previousPreview = state.wasm.previous_preview_emoji_name();
+  const nextPreview = state.wasm.next_preview_emoji_name();
+  const loginReady = !state.ui.signedIn && !state.ui.busy && state.ui.loginEnabled;
+  const defaultReady = !state.ui.signedIn
+    && !state.ui.busy
+    && !state.modeSelected
+    && state.standardCatalog.names.length > 0;
+  const isGallery = mode === 'gallery';
+  const isPreview = mode === 'preview';
+  const isSettings = mode === 'settings';
+  const isAuth = mode === 'auth';
+  const noAction = { action: 'No action', enabled: false };
+
+  if (def.ctrlKey && def.key === 'Backspace') {
+    if (isPreview) return { action: 'Close', enabled: true };
+    if (isGallery && search) return { action: 'Delete word', enabled: true };
+    return noAction;
+  }
+
+  switch (def.key) {
+    case 'F2':
+      if (isGallery && state.ui.signedIn) return { action: 'Settings', enabled: true };
+      if ((isAuth || isGallery) && loginReady) return { action: 'Slack login', enabled: true };
+      return noAction;
+    case 'd':
+      return defaultReady ? { action: 'Default emoji', enabled: true } : noAction;
+    case 'Escape':
+      if (isSettings) return { action: 'Back', enabled: true };
+      if (isPreview) return { action: 'Close', enabled: true };
+      if (isGallery && search) return { action: 'Clear search', enabled: true };
+      return noAction;
+    case 'PageUp':
+      return isGallery ? { action: 'Page up', enabled: true } : noAction;
+    case 'PageDown':
+      return isGallery ? { action: 'Page down', enabled: true } : noAction;
+    case 'ArrowUp':
+      if (isPreview) {
+        return previousPreview
+          ? { action: 'Prev emoji', enabled: true }
+          : { action: 'No previous', enabled: false };
+      }
+      return isGallery ? { action: 'Select up', enabled: true } : noAction;
+    case 'ArrowDown':
+      if (isPreview) {
+        return nextPreview
+          ? { action: 'Next emoji', enabled: true }
+          : { action: 'No next', enabled: false };
+      }
+      return isGallery ? { action: 'Select down', enabled: true } : noAction;
+    case 'ArrowLeft':
+      if (isPreview) return { action: 'Close', enabled: true };
+      return isGallery ? { action: 'Prev tab', enabled: true } : noAction;
+    case 'ArrowRight':
+      if (isPreview) return { action: 'Close', enabled: true };
+      return isGallery ? { action: 'Next tab', enabled: true } : noAction;
+    case 'Enter':
+      if (isAuth && loginReady) return { action: 'Slack login', enabled: true };
+      if (isSettings) return { action: 'Sign out', enabled: true };
+      if (isGallery) return { action: 'View emoji', enabled: true };
+      return noAction;
+    case 'Backspace':
+      if (isPreview) return { action: 'Close', enabled: true };
+      if (isGallery && search) return { action: 'Delete char', enabled: true };
+      return noAction;
+    case ' ':
+      return isGallery ? { action: 'Search space', enabled: true } : noAction;
+    default:
+      return noAction;
+  }
+}
+
+function dispatchSyntheticKey(key, options = {}) {
+  const event = new KeyboardEvent('keydown', {
+    key,
+    bubbles: true,
+    cancelable: true,
+    ctrlKey: Boolean(options.ctrlKey),
+    altKey: Boolean(options.altKey),
+  });
+  window.dispatchEvent(event);
+}
+
+function installMobileKeypad(state) {
+  const keypad = document.createElement('section');
+  keypad.id = 'mobile-keypad';
+  keypad.setAttribute('aria-label', 'Mobile keyboard controls');
+
+  const pad = document.createElement('div');
+  pad.className = 'keypad-pad';
+  keypad.append(pad);
+
+  const buttons = [];
+  const addButton = (parent, def) => {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = `keypad-button${def.small ? ' keypad-small' : ''}`;
+    button.innerHTML = '<span class="keypad-key"></span><span class="keypad-action"></span>';
+    button.addEventListener('pointerdown', (event) => event.preventDefault());
+    button.addEventListener('click', () => {
+      if (button.disabled) return;
+      dispatchSyntheticKey(def.key, def);
+      scheduleUpdate();
+    });
+    buttons.push({ def, button });
+    parent.append(button);
+  };
+
+  const bySlot = Object.fromEntries(KEYPAD_BUTTONS.map((def) => [def.slot, def]));
+  addButton(pad, bySlot.esc);
+  addButton(pad, bySlot.up);
+  addButton(pad, bySlot.pgup);
+  addButton(pad, bySlot.left);
+  addButton(pad, bySlot.enter);
+  addButton(pad, bySlot.right);
+
+  const comboCell = document.createElement('div');
+  comboCell.className = 'keypad-combo';
+  addButton(comboCell, bySlot.f2);
+  addButton(comboCell, bySlot.d);
+  pad.append(comboCell);
+
+  addButton(pad, bySlot.down);
+  addButton(pad, bySlot.pgdn);
+
+  const searchRow = document.createElement('div');
+  searchRow.className = 'keypad-search';
+  const searchInput = document.createElement('input');
+  searchInput.id = 'keypad-search-input';
+  searchInput.type = 'text';
+  searchInput.autocapitalize = 'none';
+  searchInput.autocomplete = 'off';
+  searchInput.autocorrect = 'off';
+  searchInput.spellcheck = false;
+  searchInput.placeholder = 'PRINTABLE KEYS / SEARCH';
+  searchInput.setAttribute('aria-label', 'Printable key search input');
+  searchInput.addEventListener('beforeinput', (event) => {
+    if (readKeypadMode(state) !== 'gallery') {
+      event.preventDefault();
+      return;
+    }
+    const inputType = event.inputType || '';
+    if (inputType === 'insertText' || inputType === 'insertCompositionText') {
+      event.preventDefault();
+      for (const ch of String(event.data || '')) {
+        dispatchSyntheticKey(ch);
+      }
+      scheduleUpdate();
+    } else if (inputType === 'deleteContentBackward') {
+      event.preventDefault();
+      dispatchSyntheticKey('Backspace');
+      scheduleUpdate();
+    } else if (inputType === 'deleteWordBackward') {
+      event.preventDefault();
+      dispatchSyntheticKey('Backspace', { ctrlKey: true });
+      scheduleUpdate();
+    } else {
+      event.preventDefault();
+    }
+  });
+  searchInput.addEventListener('keydown', (event) => {
+    if (event.key !== 'Backspace' && event.key !== 'Enter' && event.key !== 'Escape') {
+      return;
+    }
+    event.preventDefault();
+    if (event.key === 'Backspace') {
+      dispatchSyntheticKey('Backspace', { ctrlKey: event.ctrlKey || event.altKey });
+    } else {
+      dispatchSyntheticKey(event.key);
+      searchInput.blur();
+    }
+    scheduleUpdate();
+  });
+  searchRow.append(searchInput);
+  keypad.append(searchRow);
+  document.body.append(keypad);
+
+  function update() {
+    const mode = readKeypadMode(state);
+    for (const { def, button } of buttons) {
+      const { action, enabled } = keypadActionFor(def, state, mode);
+      button.querySelector('.keypad-key').textContent = def.label;
+      button.querySelector('.keypad-action').textContent = action;
+      const hidden = Boolean(def.hideWhenDisabled && !enabled);
+      button.classList.toggle('keypad-hidden', hidden);
+      if (def.slot === 'd') {
+        comboCell.classList.toggle('keypad-d-hidden', hidden);
+      }
+      button.disabled = !enabled || hidden;
+      button.setAttribute('aria-label', `${def.label}: ${action}`);
+      button.title = `${def.label}: ${action}`;
+    }
+    const search = state.wasm.current_search_query();
+    if (document.activeElement !== searchInput || searchInput.value !== search) {
+      searchInput.value = search;
+    }
+    searchInput.disabled = mode !== 'gallery';
+    searchInput.placeholder = mode === 'gallery' ? 'PRINTABLE KEYS / SEARCH' : 'SEARCH DISABLED';
+  }
+
+  function scheduleUpdate() {
+    window.requestAnimationFrame(update);
+    window.setTimeout(update, 80);
+  }
+
+  update();
+  return { destroy: () => keypad.remove(), update };
+}
+
+function installConditionalMobileKeypad(state) {
+  let installed = null;
+  const reconcile = () => {
+    if (shouldShowMobileKeypad()) {
+      if (!installed) {
+        installed = installMobileKeypad(state);
+        state.updateKeypad = installed.update;
+      }
+      state.updateKeypad?.();
+      return;
+    }
+    if (installed) {
+      installed.destroy();
+      installed = null;
+    }
+    state.updateKeypad = null;
+  };
+
+  window.addEventListener('resize', reconcile, { passive: true });
+  window.addEventListener('orientationchange', reconcile, { passive: true });
+  reconcile();
 }
 
 function base64Url(bytes) {
@@ -857,7 +1122,9 @@ export async function bootHostedEmojiApp(wasm) {
       loginEnabled: Boolean(config.clientId),
       catalogReady: false,
     },
+    updateKeypad: null,
   };
+  installConditionalMobileKeypad(state);
   log('boot hosted app', {
     hasClientId: Boolean(config.clientId),
     hasSession: Boolean(state.session),
@@ -1071,6 +1338,7 @@ export async function bootHostedEmojiApp(wasm) {
           signOut();
         }
       }
+      state.updateKeypad?.();
       if (!state.session && state.assetUrls.size === 0) {
         if (state.currentEmojiName) {
           state.currentEmojiName = '';
@@ -1092,6 +1360,7 @@ export async function bootHostedEmojiApp(wasm) {
         await ensureEmojiTexture(state, name);
       }
       preloadPreviewNeighbors(state);
+      state.updateKeypad?.();
     } catch (error) {
       console.error('[ultramoji-viewer-4d] tick failed', error);
       if (state.session) {

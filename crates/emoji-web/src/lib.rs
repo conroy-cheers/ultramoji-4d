@@ -166,6 +166,7 @@ thread_local! {
     static CURRENT_PREVIEW_EMOJI_NAME: RefCell<String> = RefCell::new(String::new());
     static CURRENT_PREVIEW_NEIGHBORS: RefCell<(String, String)> = RefCell::new((String::new(), String::new()));
     static CURRENT_SEARCH_QUERY: RefCell<String> = RefCell::new(String::new());
+    static CURRENT_KEYPAD_MODE: RefCell<String> = RefCell::new(String::from("auth"));
     static PENDING_HOSTED_AUTH_STATE: RefCell<Option<gallery::HostedAuthState>> = RefCell::new(None);
     static LOGIN_REQUEST_NONCE: RefCell<u32> = const { RefCell::new(0) };
     static PENDING_SETTINGS_TOGGLE: RefCell<bool> = const { RefCell::new(false) };
@@ -394,6 +395,11 @@ pub fn current_preview_emoji_name() -> String {
 #[wasm_bindgen]
 pub fn current_search_query() -> String {
     CURRENT_SEARCH_QUERY.with(|query| query.borrow().clone())
+}
+
+#[wasm_bindgen]
+pub fn current_keypad_mode() -> String {
+    CURRENT_KEYPAD_MODE.with(|mode| mode.borrow().clone())
 }
 
 #[wasm_bindgen]
@@ -967,6 +973,9 @@ impl App {
         });
         CURRENT_SEARCH_QUERY.with(|query| {
             *query.borrow_mut() = self.gallery.search_query().to_owned();
+        });
+        CURRENT_KEYPAD_MODE.with(|mode| {
+            *mode.borrow_mut() = self.gallery.keypad_mode().to_owned();
         });
         LOGIN_REQUEST_NONCE.with(|nonce| {
             *nonce.borrow_mut() = self.gallery.login_request_nonce();

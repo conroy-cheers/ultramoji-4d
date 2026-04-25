@@ -2,15 +2,160 @@
 <html>
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
     <title>Ultramoji Viewer 4D</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
-  html, body { width: 100%; height: 100%; overflow: hidden; background: #0c121c; }
-  canvas { width: 100%; height: 100%; display: block; }
+  html, body {
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: #000;
+  }
+  body {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+  }
+  canvas {
+    flex: 1 1 auto;
+    min-height: 0;
+    width: 100%;
+    height: 100%;
+    display: block;
+  }
+  button, input { font: inherit; }
   #loading {
     position: absolute; inset: 0;
     display: flex; align-items: center; justify-content: center;
     color: #50b4ff; font-family: monospace; font-size: 18px;
+  }
+  #mobile-keypad {
+    --keypad-green: #00ff66;
+    --keypad-dim: #008c3b;
+    flex: 0 0 auto;
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 6px;
+    width: min(100%, 520px);
+    margin: 0 auto;
+    padding: 6px max(6px, env(safe-area-inset-right)) max(6px, env(safe-area-inset-bottom)) max(6px, env(safe-area-inset-left));
+    background: #000;
+    color: var(--keypad-green);
+    font-family: "Glass TTY VT220", "Courier New", monospace;
+    text-transform: uppercase;
+    touch-action: manipulation;
+    user-select: none;
+  }
+  .keypad-pad {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(42px, 1fr));
+    grid-template-rows: repeat(3, 42px);
+    gap: 5px;
+  }
+  .keypad-search {
+    display: grid;
+    min-width: 0;
+  }
+  .keypad-button {
+    min-width: 0;
+    min-height: 0;
+    border: 1px solid var(--keypad-dim);
+    border-radius: 0;
+    background: #000;
+    color: var(--keypad-green);
+    letter-spacing: 0;
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .keypad-combo {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 4px;
+  }
+  .keypad-combo.keypad-d-hidden {
+    grid-template-columns: 1fr;
+  }
+  .keypad-combo .keypad-button {
+    min-width: 0;
+  }
+  .keypad-small .keypad-key {
+    font-size: 9px;
+  }
+  .keypad-small .keypad-action {
+    font-size: 7px;
+  }
+  .keypad-button:active {
+    background: #003915;
+    color: var(--keypad-green);
+    transform: translateY(1px);
+  }
+  .keypad-button[disabled] {
+    color: #00672b;
+    border-color: #00431d;
+    background: #000;
+    cursor: default;
+    transform: none;
+  }
+  .keypad-hidden { display: none; }
+  .keypad-key,
+  .keypad-action {
+    display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    padding: 0 4px;
+  }
+  .keypad-key {
+    color: var(--keypad-green);
+    font-size: 11px;
+    line-height: 1.15;
+  }
+  .keypad-action {
+    color: var(--keypad-dim);
+    font-size: 8px;
+    line-height: 1.2;
+  }
+  #keypad-search-input {
+    min-width: 0;
+    height: 100%;
+    min-height: 42px;
+    border: 1px solid var(--keypad-dim);
+    border-radius: 0;
+    padding: 0 9px;
+    background: #000;
+    color: var(--keypad-green);
+    outline: none;
+    caret-color: var(--keypad-green);
+  }
+  #keypad-search-input::placeholder { color: #00672b; }
+  #keypad-search-input:focus {
+    border-color: var(--keypad-green);
+  }
+  @media (max-width: 640px) {
+    #mobile-keypad {
+      width: 100%;
+      gap: 5px;
+    }
+    .keypad-pad {
+      grid-template-columns: repeat(3, minmax(34px, 1fr));
+      grid-template-rows: repeat(3, 36px);
+      gap: 4px;
+    }
+    #keypad-search-input {
+      min-height: 36px;
+    }
+  }
+  @media (max-height: 520px) {
+    #mobile-keypad {
+      padding-top: 4px;
+    }
+    .keypad-pad {
+      grid-template-rows: repeat(3, 32px);
+    }
+    #keypad-search-input {
+      min-height: 32px;
+    }
   }
 </style>
 </head>
@@ -78,6 +223,7 @@ try {
     clear_active_emoji_texture,
     clear_decoded_emoji_texture_cache,
     current_emoji_name,
+    current_keypad_mode,
     current_preview_emoji_name,
     current_search_query,
     next_preview_emoji_name,
@@ -159,6 +305,7 @@ try {
     clear_active_emoji_texture,
     clear_decoded_emoji_texture_cache,
     current_emoji_name,
+    current_keypad_mode,
     current_preview_emoji_name,
     current_search_query,
     next_preview_emoji_name,

@@ -183,6 +183,18 @@ impl Gallery {
         self.displayed_menu == DisplayedMenu::Settings
     }
 
+    pub fn keypad_mode(&self) -> &'static str {
+        if self.show_auth_screen() {
+            "auth"
+        } else if self.show_settings_screen() {
+            "settings"
+        } else if self.is_previewing() {
+            "preview"
+        } else {
+            "gallery"
+        }
+    }
+
     pub fn set_hosted_auth_state(&mut self, auth: HostedAuthState) {
         let should_reset_for_auth_loss = self.auth.catalog_ready && !auth.catalog_ready;
         self.auth = auth;
