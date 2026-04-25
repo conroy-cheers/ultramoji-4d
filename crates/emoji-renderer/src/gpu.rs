@@ -3227,7 +3227,7 @@ fn extruded_billboard_geometry(
     let hh = 1.0 / aspect.max(0.0001);
     let hd = hw * depth_ratio;
 
-    let max_cells = 256usize;
+    let max_cells = CONTOUR_MAX_CELLS;
     let (grid_w, grid_h) = if texture.width >= texture.height {
         let gh = ((texture.height as f32 / texture.width as f32) * max_cells as f32)
             .round()
@@ -3244,14 +3244,13 @@ fn extruded_billboard_geometry(
     let rows = grid_h + 1;
     let field = alpha_field(texture, cols, rows);
 
-    let threshold = 160.0 / 255.0;
     let field_f64: Vec<f64> = field.iter().map(|&v| v as f64).collect();
 
     let builder = contour::ContourBuilder::new(cols, rows, true)
         .x_step(1.0 / grid_w as f64)
         .y_step(1.0 / grid_h as f64);
 
-    let contours = match builder.contours(&field_f64, &[threshold]) {
+    let contours = match builder.contours(&field_f64, &[CONTOUR_ALPHA_THRESHOLD]) {
         Ok(c) => c,
         Err(_) => return billboard_geometry_rect(aspect, depth_ratio, true),
     };
@@ -3270,53 +3269,56 @@ fn extruded_billboard_geometry(
 
     let texel_u = 0.5 / texture.width.max(1) as f32;
     let texel_v = 0.5 / texture.height.max(1) as f32;
+    let simplify_epsilon = CONTOUR_SIMPLIFY_EPSILON_CELLS / grid_w.max(grid_h) as f64;
+    let max_segment_len = CONTOUR_MAX_SEGMENT_CELLS / grid_w.max(grid_h) as f64;
 
     for polygon in &multi_polygon.0 {
-        let exterior = polygon.exterior();
-        let ext_coords = exterior.coords().collect::<Vec<_>>();
-        if ext_coords.len() < 4 {
+        let raw_exterior = open_ring_from_points(
+            polygon
+                .exterior()
+                .coords()
+                .map(|coord| [coord.x, coord.y])
+                .collect(),
+        );
+        if raw_exterior.len() < MIN_SIMPLIFIED_RING_POINTS {
             continue;
         }
 
-        // Build flat coordinate array for earcutr: exterior + holes
-        let mut flat_coords: Vec<f64> = Vec::new();
-        let mut hole_indices: Vec<usize> = Vec::new();
-
-        // Exterior ring (skip the closing duplicate point)
-        let ext_len = ext_coords.len() - 1;
-        for &coord in &ext_coords[..ext_len] {
-            flat_coords.push(coord.x);
-            flat_coords.push(coord.y);
-        }
-
-        // Interior rings (holes)
+        let mut raw_holes = Vec::new();
         for interior in polygon.interiors() {
-            let hole_coords: Vec<_> = interior.coords().collect();
-            if hole_coords.len() < 4 {
-                continue;
-            }
-            hole_indices.push(flat_coords.len() / 2);
-            let hole_len = hole_coords.len() - 1;
-            for &coord in &hole_coords[..hole_len] {
-                flat_coords.push(coord.x);
-                flat_coords.push(coord.y);
+            let raw_hole =
+                open_ring_from_points(interior.coords().map(|coord| [coord.x, coord.y]).collect());
+            if raw_hole.len() >= MIN_SIMPLIFIED_RING_POINTS {
+                raw_holes.push(raw_hole);
             }
         }
 
-        let n_verts = flat_coords.len() / 2;
-        if n_verts < 3 {
+        let simplified_exterior = regularize_ring(&raw_exterior, simplify_epsilon, max_segment_len);
+        let simplified_holes: Vec<_> = raw_holes
+            .iter()
+            .map(|hole| regularize_ring(hole, simplify_epsilon, max_segment_len))
+            .collect();
+
+        let raw_rings = PolygonRings {
+            exterior: &raw_exterior,
+            holes: &raw_holes,
+        };
+        let simplified_rings = PolygonRings {
+            exterior: &simplified_exterior,
+            holes: &simplified_holes,
+        };
+        let polygon_mesh =
+            triangulate_rings(simplified_rings).or_else(|| triangulate_rings(raw_rings));
+        let Some(polygon_mesh) = polygon_mesh else {
             continue;
-        }
-
-        let tri_indices = match earcutr::earcut(&flat_coords, &hole_indices, 2) {
-            Ok(t) => t,
-            Err(_) => continue,
         };
 
         // Build UV and position arrays from flat coords
         // contour crate outputs coordinates in [0, 1] UV space (due to x_step/y_step)
-        let uv_points: Vec<[f32; 2]> = (0..n_verts)
-            .map(|i| [flat_coords[i * 2] as f32, flat_coords[i * 2 + 1] as f32])
+        let uv_points: Vec<[f32; 2]> = polygon_mesh
+            .flat_coords
+            .chunks_exact(2)
+            .map(|coord| [coord[0] as f32, coord[1] as f32])
             .collect();
 
         let pos_points: Vec<[f32; 2]> = uv_points
@@ -3330,7 +3332,7 @@ fn extruded_billboard_geometry(
             &mut indices,
             &uv_points,
             &pos_points,
-            &tri_indices,
+            &polygon_mesh.tri_indices,
             texel_u,
             texel_v,
             hd,
@@ -3345,7 +3347,7 @@ fn extruded_billboard_geometry(
             &mut indices,
             &uv_points,
             &pos_points,
-            &tri_indices,
+            &polygon_mesh.tri_indices,
             texel_u,
             texel_v,
             -hd,
@@ -3357,21 +3359,16 @@ fn extruded_billboard_geometry(
         emit_side_walls(
             &mut vertices,
             &mut indices,
-            &uv_points[..ext_len],
-            &pos_points[..ext_len],
+            &uv_points[..polygon_mesh.exterior_len],
+            &pos_points[..polygon_mesh.exterior_len],
             texel_u,
             texel_v,
             hd,
         );
 
         // Side walls along each hole (wound opposite direction for inward-facing normals)
-        let mut hole_start = ext_len;
-        for interior in polygon.interiors() {
-            let hole_coords: Vec<_> = interior.coords().collect();
-            if hole_coords.len() < 4 {
-                continue;
-            }
-            let hole_len = hole_coords.len() - 1;
+        let mut hole_start = polygon_mesh.exterior_len;
+        for &hole_len in &polygon_mesh.hole_lens {
             let hole_end = hole_start + hole_len;
             emit_side_walls(
                 &mut vertices,
@@ -3393,11 +3390,73 @@ fn extruded_billboard_geometry(
     }
 }
 
-fn push_quad(
+const CONTOUR_MAX_CELLS: usize = 384;
+const CONTOUR_ALPHA_THRESHOLD: f64 = 160.0 / 255.0;
+const CONTOUR_SIMPLIFY_EPSILON_CELLS: f64 = 0.45;
+const CONTOUR_MAX_SEGMENT_CELLS: f64 = 1.5;
+const MIN_SIMPLIFIED_RING_POINTS: usize = 3;
+
+struct PolygonRings<'a> {
+    exterior: &'a [[f64; 2]],
+    holes: &'a [Vec<[f64; 2]>],
+}
+
+struct PolygonMesh {
+    flat_coords: Vec<f64>,
+    tri_indices: Vec<usize>,
+    exterior_len: usize,
+    hole_lens: Vec<usize>,
+}
+
+fn triangulate_rings(rings: PolygonRings<'_>) -> Option<PolygonMesh> {
+    if rings.exterior.len() < MIN_SIMPLIFIED_RING_POINTS {
+        return None;
+    }
+
+    let mut flat_coords = Vec::new();
+    let mut hole_indices = Vec::new();
+    let mut hole_lens = Vec::new();
+
+    append_ring_coords(&mut flat_coords, rings.exterior);
+    for hole in rings.holes {
+        if hole.len() < MIN_SIMPLIFIED_RING_POINTS {
+            continue;
+        }
+        hole_indices.push(flat_coords.len() / 2);
+        hole_lens.push(hole.len());
+        append_ring_coords(&mut flat_coords, hole);
+    }
+
+    let n_verts = flat_coords.len() / 2;
+    if n_verts < MIN_SIMPLIFIED_RING_POINTS {
+        return None;
+    }
+
+    let tri_indices = earcutr::earcut(&flat_coords, &hole_indices, 2).ok()?;
+    if tri_indices.is_empty() {
+        return None;
+    }
+
+    Some(PolygonMesh {
+        flat_coords,
+        tri_indices,
+        exterior_len: rings.exterior.len(),
+        hole_lens,
+    })
+}
+
+fn append_ring_coords(flat_coords: &mut Vec<f64>, ring: &[[f64; 2]]) {
+    for &[x, y] in ring {
+        flat_coords.push(x);
+        flat_coords.push(y);
+    }
+}
+
+fn push_quad_with_normals(
     vertices: &mut Vec<Vertex>,
     indices: &mut Vec<u16>,
     positions: [[f32; 3]; 4],
-    normal: [f32; 3],
+    normals: [[f32; 3]; 4],
     uvs: [[f32; 2]; 4],
     face_type: u32,
 ) {
@@ -3405,7 +3464,7 @@ fn push_quad(
     for i in 0..4 {
         vertices.push(Vertex {
             position: positions[i],
-            normal,
+            normal: normals[i],
             uv: uvs[i],
             face_type,
             _pad: 0,
@@ -3465,25 +3524,50 @@ fn emit_side_walls(
     if n < 2 {
         return;
     }
+    let mut segment_normals = Vec::with_capacity(n);
+    for i in 0..n {
+        let j = (i + 1) % n;
+        let [ax, ay] = pos_ring[i];
+        let [bx, by] = pos_ring[j];
+        segment_normals.push(normalize([(by - ay) as f64, -(bx - ax) as f64, 0.0]));
+    }
+
+    let mut vertex_normals = Vec::with_capacity(n);
+    for i in 0..n {
+        let prev = segment_normals[(i + n - 1) % n];
+        let curr = segment_normals[i];
+        let averaged = normalize([prev[0] + curr[0], prev[1] + curr[1], 0.0]);
+        if averaged[0].abs() <= f64::EPSILON && averaged[1].abs() <= f64::EPSILON {
+            vertex_normals.push(curr);
+        } else {
+            vertex_normals.push(averaged);
+        }
+    }
+
     for i in 0..n {
         let j = (i + 1) % n;
         let [au, av] = uv_ring[i];
         let [bu, bv] = uv_ring[j];
         let [ax, ay] = pos_ring[i];
         let [bx, by] = pos_ring[j];
-
-        let normal = normalize([(by - ay) as f64, -(bx - ax) as f64, 0.0]);
+        let normal_a = vertex_normals[i];
+        let normal_b = vertex_normals[j];
 
         let au_c = au.clamp(texel_u, 1.0 - texel_u);
         let av_c = av.clamp(texel_v, 1.0 - texel_v);
         let bu_c = bu.clamp(texel_u, 1.0 - texel_u);
         let bv_c = bv.clamp(texel_v, 1.0 - texel_v);
 
-        push_quad(
+        push_quad_with_normals(
             vertices,
             indices,
             [[ax, ay, -hd], [ax, ay, hd], [bx, by, hd], [bx, by, -hd]],
-            [normal[0] as f32, normal[1] as f32, 0.0],
+            [
+                [normal_a[0] as f32, normal_a[1] as f32, 0.0],
+                [normal_a[0] as f32, normal_a[1] as f32, 0.0],
+                [normal_b[0] as f32, normal_b[1] as f32, 0.0],
+                [normal_b[0] as f32, normal_b[1] as f32, 0.0],
+            ],
             [[au_c, av_c], [au_c, av_c], [bu_c, bv_c], [bu_c, bv_c]],
             2,
         );
@@ -3496,10 +3580,196 @@ fn alpha_field(texture: &Texture, cols: usize, rows: usize) -> Vec<f32> {
         let v = gy as f64 / (rows - 1).max(1) as f64;
         for gx in 0..cols {
             let u = gx as f64 / (cols - 1).max(1) as f64;
-            field[gy * cols + gx] = texture.sample(u, v)[3] as f32 / 255.0;
+            field[gy * cols + gx] = sample_alpha_bilinear(texture, u, v);
         }
     }
     field
+}
+
+fn sample_alpha_bilinear(texture: &Texture, u: f64, v: f64) -> f32 {
+    if texture.width == 0 || texture.height == 0 {
+        return 0.0;
+    }
+
+    let x = u.clamp(0.0, 1.0) * (texture.width - 1) as f64;
+    let y = v.clamp(0.0, 1.0) * (texture.height - 1) as f64;
+    let x0 = x.floor() as u32;
+    let y0 = y.floor() as u32;
+    let x1 = (x0 + 1).min(texture.width - 1);
+    let y1 = (y0 + 1).min(texture.height - 1);
+    let tx = (x - x0 as f64) as f32;
+    let ty = (y - y0 as f64) as f32;
+
+    let alpha = |px: u32, py: u32| -> f32 {
+        texture
+            .pixels
+            .get((py * texture.width + px) as usize)
+            .map(|pixel| pixel[3] as f32 / 255.0)
+            .unwrap_or(0.0)
+    };
+
+    let a00 = alpha(x0, y0);
+    let a10 = alpha(x1, y0);
+    let a01 = alpha(x0, y1);
+    let a11 = alpha(x1, y1);
+    let top = a00 + (a10 - a00) * tx;
+    let bottom = a01 + (a11 - a01) * tx;
+    top + (bottom - top) * ty
+}
+
+fn open_ring_from_points(mut ring: Vec<[f64; 2]>) -> Vec<[f64; 2]> {
+    while ring.len() >= 2 && same_point(ring[0], *ring.last().unwrap()) {
+        ring.pop();
+    }
+
+    let mut deduped = Vec::with_capacity(ring.len());
+    for point in ring {
+        if deduped
+            .last()
+            .is_none_or(|previous| !same_point(*previous, point))
+        {
+            deduped.push(point);
+        }
+    }
+    if deduped.len() >= 2 && same_point(deduped[0], *deduped.last().unwrap()) {
+        deduped.pop();
+    }
+    deduped
+}
+
+fn regularize_ring(ring: &[[f64; 2]], epsilon: f64, max_segment_len: f64) -> Vec<[f64; 2]> {
+    let simplified = simplify_ring(ring, epsilon);
+    if simplified.len() < MIN_SIMPLIFIED_RING_POINTS {
+        simplified
+    } else {
+        resample_ring(&simplified, max_segment_len)
+    }
+}
+
+fn simplify_ring(ring: &[[f64; 2]], epsilon: f64) -> Vec<[f64; 2]> {
+    let ring = open_ring_from_points(ring.to_vec());
+    if ring.len() <= MIN_SIMPLIFIED_RING_POINTS {
+        return ring;
+    }
+
+    let (start, end) = farthest_point_pair(&ring);
+    if start == end {
+        return ring;
+    }
+
+    let path_a = cyclic_path(&ring, start, end);
+    let path_b = cyclic_path(&ring, end, start);
+    let simplified_a = rdp_polyline(&path_a, epsilon);
+    let simplified_b = rdp_polyline(&path_b, epsilon);
+
+    let mut simplified = simplified_a;
+    simplified.extend(simplified_b.into_iter().skip(1));
+    let simplified = open_ring_from_points(simplified);
+    if simplified.len() < MIN_SIMPLIFIED_RING_POINTS {
+        ring
+    } else {
+        simplified
+    }
+}
+
+fn resample_ring(ring: &[[f64; 2]], max_segment_len: f64) -> Vec<[f64; 2]> {
+    if ring.len() < MIN_SIMPLIFIED_RING_POINTS || max_segment_len <= f64::EPSILON {
+        return ring.to_vec();
+    }
+
+    let mut resampled = Vec::with_capacity(ring.len());
+    for i in 0..ring.len() {
+        let a = ring[i];
+        let b = ring[(i + 1) % ring.len()];
+        resampled.push(a);
+
+        let len = dist_sq(a, b).sqrt();
+        let segment_count = (len / max_segment_len).ceil().max(1.0) as usize;
+        for step in 1..segment_count {
+            let t = step as f64 / segment_count as f64;
+            resampled.push([a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]);
+        }
+    }
+
+    open_ring_from_points(resampled)
+}
+
+fn farthest_point_pair(points: &[[f64; 2]]) -> (usize, usize) {
+    let mut best = (0usize, 0usize);
+    let mut best_dist = 0.0f64;
+    for i in 0..points.len() {
+        for j in (i + 1)..points.len() {
+            let dist = dist_sq(points[i], points[j]);
+            if dist > best_dist {
+                best = (i, j);
+                best_dist = dist;
+            }
+        }
+    }
+    best
+}
+
+fn cyclic_path(points: &[[f64; 2]], start: usize, end: usize) -> Vec<[f64; 2]> {
+    let mut path = Vec::new();
+    let mut index = start;
+    loop {
+        path.push(points[index]);
+        if index == end {
+            break;
+        }
+        index = (index + 1) % points.len();
+    }
+    path
+}
+
+fn rdp_polyline(points: &[[f64; 2]], epsilon: f64) -> Vec<[f64; 2]> {
+    if points.len() <= 2 {
+        return points.to_vec();
+    }
+
+    let first = points[0];
+    let last = points[points.len() - 1];
+    let mut split = 0usize;
+    let mut max_dist = 0.0f64;
+    for (index, &point) in points.iter().enumerate().take(points.len() - 1).skip(1) {
+        let dist = point_segment_distance(point, first, last);
+        if dist > max_dist {
+            max_dist = dist;
+            split = index;
+        }
+    }
+
+    if max_dist <= epsilon {
+        return vec![first, last];
+    }
+
+    let mut left = rdp_polyline(&points[..=split], epsilon);
+    let right = rdp_polyline(&points[split..], epsilon);
+    left.pop();
+    left.extend(right);
+    left
+}
+
+fn point_segment_distance(point: [f64; 2], a: [f64; 2], b: [f64; 2]) -> f64 {
+    let ab = [b[0] - a[0], b[1] - a[1]];
+    let ap = [point[0] - a[0], point[1] - a[1]];
+    let len_sq = ab[0] * ab[0] + ab[1] * ab[1];
+    if len_sq <= f64::EPSILON {
+        return dist_sq(point, a).sqrt();
+    }
+    let t = ((ap[0] * ab[0] + ap[1] * ab[1]) / len_sq).clamp(0.0, 1.0);
+    let closest = [a[0] + ab[0] * t, a[1] + ab[1] * t];
+    dist_sq(point, closest).sqrt()
+}
+
+fn dist_sq(a: [f64; 2], b: [f64; 2]) -> f64 {
+    let dx = a[0] - b[0];
+    let dy = a[1] - b[1];
+    dx * dx + dy * dy
+}
+
+fn same_point(a: [f64; 2], b: [f64; 2]) -> bool {
+    dist_sq(a, b) <= 1.0e-24
 }
 
 #[cfg(test)]
@@ -3631,6 +3901,122 @@ mod tests {
         assert!(
             has_diagonal,
             "circle should have diagonal side-wall normals"
+        );
+    }
+
+    #[test]
+    fn ring_regularization_collapses_stair_stepped_edge() {
+        let ring = vec![
+            [0.0, 0.0],
+            [0.1, 0.012],
+            [0.2, -0.009],
+            [0.3, 0.011],
+            [0.4, -0.008],
+            [0.5, 0.01],
+            [0.6, -0.01],
+            [0.7, 0.009],
+            [0.8, -0.011],
+            [0.9, 0.008],
+            [1.0, 0.0],
+            [1.0, 1.0],
+            [0.0, 1.0],
+        ];
+
+        let simplified = simplify_ring(&ring, 0.03);
+        assert!(
+            simplified.len() < ring.len() / 2,
+            "stair-stepped straight edge should collapse; raw={} simplified={}",
+            ring.len(),
+            simplified.len()
+        );
+        assert!(
+            simplified
+                .iter()
+                .any(|point| point[0] <= 0.01 && point[1] <= 0.01),
+            "must preserve lower-left corner"
+        );
+        assert!(
+            simplified
+                .iter()
+                .any(|point| point[0] >= 0.99 && point[1] >= 0.99),
+            "must preserve upper-right corner"
+        );
+    }
+
+    #[test]
+    fn ring_regularization_resamples_long_edges() {
+        let ring = vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+        let regularized = regularize_ring(&ring, 0.001, 0.1);
+        assert!(
+            regularized.len() >= 40,
+            "long edges should be tessellated; got {} points",
+            regularized.len()
+        );
+    }
+
+    #[test]
+    fn circle_side_wall_normals_are_smoothed_across_segments() {
+        let mut pixels = vec![[0, 0, 0, 0]; 32 * 32];
+        for y in 0..32 {
+            for x in 0..32 {
+                let dx = x as f32 - 15.5;
+                let dy = y as f32 - 15.5;
+                if dx * dx + dy * dy < 12.0 * 12.0 {
+                    pixels[y * 32 + x] = [255, 0, 0, 255];
+                }
+            }
+        }
+        let leaked = Box::leak(pixels.into_boxed_slice());
+        let texture = Texture {
+            pixels: leaked,
+            width: 32,
+            height: 32,
+        };
+        let (vertices, indices) = extruded_billboard_geometry(&texture, 0.1, true);
+        assert!(!indices.is_empty());
+
+        let side_vertices: Vec<_> = vertices.iter().filter(|v| v.face_type == 2).collect();
+        let has_interpolated_side_quad = side_vertices.chunks_exact(4).any(|quad| {
+            let a = quad[0].normal;
+            let b = quad[2].normal;
+            let dot = a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+            dot < 0.999
+        });
+        assert!(
+            has_interpolated_side_quad,
+            "curved side walls should interpolate between endpoint normals"
+        );
+    }
+
+    #[test]
+    fn donut_shape_keeps_inner_side_walls() {
+        let mut pixels = vec![[0, 0, 0, 0]; 64 * 64];
+        for y in 0..64 {
+            for x in 0..64 {
+                let dx = x as f32 - 31.5;
+                let dy = y as f32 - 31.5;
+                let r2 = dx * dx + dy * dy;
+                if r2 < 24.0 * 24.0 && r2 > 9.0 * 9.0 {
+                    pixels[y * 64 + x] = [255, 0, 0, 255];
+                }
+            }
+        }
+        let leaked = Box::leak(pixels.into_boxed_slice());
+        let texture = Texture {
+            pixels: leaked,
+            width: 64,
+            height: 64,
+        };
+        let (vertices, indices) = extruded_billboard_geometry(&texture, 0.1, true);
+        assert!(!indices.is_empty());
+
+        let has_inner_side_wall = vertices.iter().filter(|v| v.face_type == 2).any(|v| {
+            let radius = (v.position[0] * v.position[0] + v.position[1] * v.position[1]).sqrt();
+            radius < 0.45
+        });
+        assert!(
+            has_inner_side_wall,
+            "donut-like shapes should retain hole side walls after simplification"
         );
     }
 
