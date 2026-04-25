@@ -1,4 +1,5 @@
 use anyhow::{Result, anyhow};
+use std::borrow::Cow;
 use wgpu::util::DeviceExt;
 
 use crate::texture::*;
@@ -485,6 +486,33 @@ struct PrecomputedShadowState {
     ready: Vec<bool>,
 }
 
+fn shader_source(depth_texture_load_supported: bool) -> Cow<'static, str> {
+    const SOURCE: &str = include_str!("shader.wgsl");
+    if depth_texture_load_supported {
+        return Cow::Borrowed(SOURCE);
+    }
+
+    let start = SOURCE
+        .find("// WEBGPU_SHADOW_MAP_AMOUNT_START")
+        .expect("shader shadow-map start marker missing");
+    let end_marker = "// WEBGPU_SHADOW_MAP_AMOUNT_END";
+    let end = SOURCE
+        .find(end_marker)
+        .expect("shader shadow-map end marker missing")
+        + end_marker.len();
+    let mut webgl_source = String::with_capacity(SOURCE.len());
+    webgl_source.push_str(&SOURCE[..start]);
+    webgl_source.push_str(
+        r#"fn shadow_map_amount(light_position: vec4f) -> f32 {
+    _ = light_position;
+    return 0.0;
+}
+"#,
+    );
+    webgl_source.push_str(&SOURCE[end..]);
+    Cow::Owned(webgl_source)
+}
+
 impl GpuRenderer {
     pub fn from_device_queue(
         device: wgpu::Device,
@@ -492,12 +520,14 @@ impl GpuRenderer {
         features: wgpu::Features,
         linear_depth_format: wgpu::TextureFormat,
         independent_blend_supported: bool,
+        depth_texture_load_supported: bool,
     ) -> Result<Self> {
         let max_texture_dimension_2d = device.limits().max_texture_dimension_2d;
+        let shader_source = shader_source(depth_texture_load_supported);
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("billboard_shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(shader_source),
         });
 
         let uniform_bind_group_layout =

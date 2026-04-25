@@ -7,7 +7,10 @@ use emoji_renderer::gpu::{GpuRenderer, emoji_preview_scene_params};
 use emoji_renderer::texture::{COLOR_SOURCE_ALPHA_THRESHOLD, fill_transparent_rgb_from_nearest};
 use js_sys::{Object, Reflect};
 use wasm_bindgen::prelude::*;
-use web_sys::{HtmlCanvasElement, MouseEvent, WheelEvent};
+use web_sys::{
+    AddEventListenerOptions, HtmlCanvasElement, MouseEvent, PointerEvent, Touch, TouchEvent,
+    WheelEvent,
+};
 
 mod gallery;
 mod egui_panel {
@@ -480,11 +483,10 @@ fn debug_log(message: &str) {
 
 fn required_limits_for_adapter(adapter: &wgpu::Adapter) -> wgpu::Limits {
     let adapter_limits = adapter.limits();
-    let base_limits = if adapter.get_info().backend == wgpu::Backend::Gl {
-        wgpu::Limits::downlevel_webgl2_defaults()
-    } else {
-        wgpu::Limits::default()
-    };
+    if adapter.get_info().backend == wgpu::Backend::Gl {
+        return adapter_limits;
+    }
+    let base_limits = wgpu::Limits::default();
     base_limits
         .using_resolution(adapter_limits.clone())
         .using_alignment(adapter_limits)
@@ -500,7 +502,15 @@ async fn request_surface_adapter(
         ..Default::default()
     };
     let instance = wgpu::util::new_instance_with_webgpu_detection(&instance_desc).await;
-    let surface = instance.create_surface(wgpu::SurfaceTarget::Canvas(canvas.clone()))?;
+    let surface = match instance.create_surface(wgpu::SurfaceTarget::Canvas(canvas.clone())) {
+        Ok(surface) => surface,
+        Err(err) => {
+            debug_log(&format!(
+                "surface creation failed for backends={backends:?}: {err}"
+            ));
+            return Ok(None);
+        }
+    };
     let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions {
             power_preference,
@@ -508,7 +518,11 @@ async fn request_surface_adapter(
             compatible_surface: Some(&surface),
         })
         .await;
-    Ok(adapter.map(|adapter| (surface, adapter)))
+    let Some(adapter) = adapter else {
+        debug_log(&format!("no adapter for backends={backends:?}"));
+        return Ok(None);
+    };
+    Ok(Some((surface, adapter)))
 }
 
 fn show_startup_error(message: &str) {
@@ -573,6 +587,12 @@ async fn run() {
 
     let app = std::rc::Rc::new(std::cell::RefCell::new(app));
     let window = web_sys::window().unwrap();
+    let document = window.document().unwrap();
+    let non_passive_listener = {
+        let options = AddEventListenerOptions::new();
+        options.set_passive(false);
+        options
+    };
 
     {
         let app = app.clone();
@@ -673,6 +693,152 @@ async fn run() {
             .add_event_listener_with_callback("mouseup", mouseup.as_ref().unchecked_ref())
             .unwrap();
         mouseup.forget();
+    }
+
+    {
+        let app_ref = app.clone();
+        let canvas = app.borrow().canvas.clone();
+        let pointerdown =
+            Closure::<dyn FnMut(PointerEvent)>::wrap(Box::new(move |event: PointerEvent| {
+                if let Ok(mut app) = app_ref.try_borrow_mut() {
+                    app.handle_touch_pointer_down(event);
+                }
+            }));
+        canvas
+            .add_event_listener_with_callback_and_add_event_listener_options(
+                "pointerdown",
+                pointerdown.as_ref().unchecked_ref(),
+                &non_passive_listener,
+            )
+            .unwrap();
+        pointerdown.forget();
+    }
+
+    {
+        let app_ref = app.clone();
+        let pointermove =
+            Closure::<dyn FnMut(PointerEvent)>::wrap(Box::new(move |event: PointerEvent| {
+                if let Ok(mut app) = app_ref.try_borrow_mut() {
+                    app.handle_touch_pointer_move(event);
+                }
+            }));
+        document
+            .add_event_listener_with_callback_and_add_event_listener_options(
+                "pointermove",
+                pointermove.as_ref().unchecked_ref(),
+                &non_passive_listener,
+            )
+            .unwrap();
+        pointermove.forget();
+    }
+
+    {
+        let app = app.clone();
+        let pointerup =
+            Closure::<dyn FnMut(PointerEvent)>::wrap(Box::new(move |event: PointerEvent| {
+                if let Ok(mut app) = app.try_borrow_mut() {
+                    app.handle_touch_pointer_up(event);
+                }
+            }));
+        document
+            .add_event_listener_with_callback_and_add_event_listener_options(
+                "pointerup",
+                pointerup.as_ref().unchecked_ref(),
+                &non_passive_listener,
+            )
+            .unwrap();
+        pointerup.forget();
+    }
+
+    {
+        let app = app.clone();
+        let pointercancel =
+            Closure::<dyn FnMut(PointerEvent)>::wrap(Box::new(move |event: PointerEvent| {
+                if let Ok(mut app) = app.try_borrow_mut() {
+                    app.handle_touch_pointer_cancel(event);
+                }
+            }));
+        document
+            .add_event_listener_with_callback_and_add_event_listener_options(
+                "pointercancel",
+                pointercancel.as_ref().unchecked_ref(),
+                &non_passive_listener,
+            )
+            .unwrap();
+        pointercancel.forget();
+    }
+
+    {
+        let app_ref = app.clone();
+        let canvas = app.borrow().canvas.clone();
+        let touchstart =
+            Closure::<dyn FnMut(TouchEvent)>::wrap(Box::new(move |event: TouchEvent| {
+                if let Ok(mut app) = app_ref.try_borrow_mut() {
+                    app.handle_touch_start(event);
+                }
+            }));
+        canvas
+            .add_event_listener_with_callback_and_add_event_listener_options(
+                "touchstart",
+                touchstart.as_ref().unchecked_ref(),
+                &non_passive_listener,
+            )
+            .unwrap();
+        touchstart.forget();
+    }
+
+    {
+        let app_ref = app.clone();
+        let touchmove =
+            Closure::<dyn FnMut(TouchEvent)>::wrap(Box::new(move |event: TouchEvent| {
+                if let Ok(mut app) = app_ref.try_borrow_mut() {
+                    app.handle_touch_move(event);
+                }
+            }));
+        document
+            .add_event_listener_with_callback_and_add_event_listener_options(
+                "touchmove",
+                touchmove.as_ref().unchecked_ref(),
+                &non_passive_listener,
+            )
+            .unwrap();
+        touchmove.forget();
+    }
+
+    {
+        let app = app.clone();
+        let touchend =
+            Closure::<dyn FnMut(TouchEvent)>::wrap(Box::new(move |event: TouchEvent| {
+                if let Ok(mut app) = app.try_borrow_mut() {
+                    app.handle_touch_end(event);
+                }
+            }));
+        document
+            .add_event_listener_with_callback_and_add_event_listener_options(
+                "touchend",
+                touchend.as_ref().unchecked_ref(),
+                &non_passive_listener,
+            )
+            .unwrap();
+        touchend.forget();
+    }
+
+    {
+        let app = app.clone();
+        let touchcancel =
+            Closure::<dyn FnMut(TouchEvent)>::wrap(Box::new(move |event: TouchEvent| {
+                if let Ok(mut app) = app.try_borrow_mut() {
+                    app.handle_touch_cancel(event);
+                }
+            }));
+        document
+            .add_event_listener_with_callback_and_add_event_listener_options(
+                "touchcancel",
+                touchcancel.as_ref().unchecked_ref(),
+                &non_passive_listener,
+            )
+            .unwrap();
+        touchcancel.forget();
     }
 
     {
@@ -783,6 +949,8 @@ struct App {
     preview_drag_last_movement_time_secs: f64,
     preview_drag_anchor_rotation: f32,
     preview_rotation_velocity: f32,
+    active_touch_pointer_id: Option<i32>,
+    active_touch_identifier: Option<i32>,
     last_billboard_canvas_rect: [f32; 4],
     smoothed_frame_cpu_ms: f32,
     smoothed_frame_interval_ms: f32,
@@ -993,6 +1161,8 @@ impl App {
         self.preview_drag_last_movement_time_secs = 0.0;
         self.preview_drag_anchor_rotation = 0.0;
         self.preview_rotation_velocity = 0.0;
+        self.active_touch_pointer_id = None;
+        self.active_touch_identifier = None;
     }
 
     fn preview_scene_time_secs_at(&self, time_secs: f64) -> f64 {
@@ -1017,6 +1187,14 @@ impl App {
     }
 
     fn event_time_secs(event: &MouseEvent) -> f64 {
+        event.time_stamp() / 1000.0
+    }
+
+    fn pointer_event_time_secs(event: &PointerEvent) -> f64 {
+        event.time_stamp() / 1000.0
+    }
+
+    fn touch_event_time_secs(event: &TouchEvent) -> f64 {
         event.time_stamp() / 1000.0
     }
 
@@ -1056,22 +1234,95 @@ impl App {
         self.preview_drag_last_movement_time_secs = event_time_secs;
     }
 
-    fn pointer_surface_pos(&self, event: &MouseEvent) -> [f32; 2] {
+    fn pointer_surface_pos_from_offsets(&self, offset_x: f32, offset_y: f32) -> [f32; 2] {
         let client_w = self.canvas.client_width().max(1) as f32;
         let client_h = self.canvas.client_height().max(1) as f32;
         [
-            event.offset_x() as f32 / client_w * self.config.width.max(1) as f32,
-            event.offset_y() as f32 / client_h * self.config.height.max(1) as f32,
+            offset_x / client_w * self.config.width.max(1) as f32,
+            offset_y / client_h * self.config.height.max(1) as f32,
         ]
     }
 
-    fn point_in_rect(point: [f32; 2], rect: [f32; 4]) -> bool {
-        rect[2] > 0.0
-            && rect[3] > 0.0
-            && point[0] >= rect[0]
-            && point[0] <= rect[0] + rect[2]
-            && point[1] >= rect[1]
-            && point[1] <= rect[1] + rect[3]
+    fn pointer_surface_pos(&self, event: &MouseEvent) -> [f32; 2] {
+        self.pointer_surface_pos_from_offsets(event.offset_x() as f32, event.offset_y() as f32)
+    }
+
+    fn pointer_event_surface_pos(&self, event: &PointerEvent) -> [f32; 2] {
+        let rect = self.canvas.get_bounding_client_rect();
+        self.pointer_surface_pos_from_offsets(
+            (event.client_x() as f64 - rect.left()) as f32,
+            (event.client_y() as f64 - rect.top()) as f32,
+        )
+    }
+
+    fn pointer_event_egui_pos(&self, event: &PointerEvent) -> egui::Pos2 {
+        let rect = self.canvas.get_bounding_client_rect();
+        egui::pos2(
+            (event.client_x() as f64 - rect.left()) as f32,
+            (event.client_y() as f64 - rect.top()) as f32,
+        )
+    }
+
+    fn touch_surface_pos(&self, touch: &Touch) -> [f32; 2] {
+        let rect = self.canvas.get_bounding_client_rect();
+        self.pointer_surface_pos_from_offsets(
+            (touch.client_x() as f64 - rect.left()) as f32,
+            (touch.client_y() as f64 - rect.top()) as f32,
+        )
+    }
+
+    fn touch_egui_pos(&self, touch: &Touch) -> egui::Pos2 {
+        let rect = self.canvas.get_bounding_client_rect();
+        egui::pos2(
+            (touch.client_x() as f64 - rect.left()) as f32,
+            (touch.client_y() as f64 - rect.top()) as f32,
+        )
+    }
+
+    fn changed_touch_by_identifier(event: &TouchEvent, identifier: i32) -> Option<Touch> {
+        let touches = event.changed_touches();
+        for index in 0..touches.length() {
+            let touch = touches.item(index)?;
+            if touch.identifier() == identifier {
+                return Some(touch);
+            }
+        }
+        None
+    }
+
+    fn begin_preview_drag(&mut self, surface_x: f32, event_time_secs: f64) {
+        self.preview_dragging = true;
+        self.preview_drag_last_x = surface_x;
+        self.preview_drag_last_time_secs = event_time_secs;
+        self.preview_drag_last_movement_time_secs = event_time_secs;
+        self.preview_rotation_velocity = 0.0;
+        self.preview_drag_anchor_rotation = self.preview_manual_rotation.unwrap_or_else(|| {
+            Self::automatic_preview_rotation(self.current_preview_scene_time_secs())
+        });
+    }
+
+    fn update_preview_drag(&mut self, surface_x: f32, event_time_secs: f64) {
+        self.record_preview_drag_sample(surface_x, event_time_secs);
+    }
+
+    fn end_preview_drag(&mut self, surface_x: f32, event_time_secs: f64) {
+        self.record_preview_drag_sample(surface_x, event_time_secs);
+        let release_was_still = event_time_secs - self.preview_drag_last_movement_time_secs
+            > PREVIEW_DRAG_RELEASE_MAX_STILL_SECS;
+        if release_was_still
+            || self.preview_rotation_velocity.abs() < PREVIEW_DRAG_RELEASE_MIN_VELOCITY
+        {
+            self.preview_rotation_velocity = 0.0;
+        }
+        self.preview_dragging = false;
+    }
+
+    fn drag_pointer_event_applies(event: &PointerEvent) -> bool {
+        event.is_primary() && matches!(event.pointer_type().as_str(), "touch" | "pen")
+    }
+
+    fn can_start_preview_drag(&self) -> bool {
+        !self.settings_visible && self.gallery.is_previewing()
     }
 
     fn current_preview_frame_index(&self, scene_time_secs: f64) -> Option<usize> {
@@ -1172,6 +1423,7 @@ impl App {
             features,
             linear_depth_format,
             independent_blend_supported,
+            adapter_info.backend != wgpu::Backend::Gl,
         )?;
 
         let caps = surface.get_capabilities(&adapter);
@@ -1523,6 +1775,8 @@ impl App {
             preview_drag_last_movement_time_secs: 0.0,
             preview_drag_anchor_rotation: 0.0,
             preview_rotation_velocity: 0.0,
+            active_touch_pointer_id: None,
+            active_touch_identifier: None,
             last_billboard_canvas_rect: [0.0; 4],
             smoothed_frame_cpu_ms: 0.0,
             smoothed_frame_interval_ms: 0.0,
@@ -1599,7 +1853,7 @@ impl App {
             event.prevent_default();
             let surface_pos = self.pointer_surface_pos(&event);
             let event_time_secs = Self::event_time_secs(&event);
-            self.record_preview_drag_sample(surface_pos[0], event_time_secs);
+            self.update_preview_drag(surface_pos[0], event_time_secs);
         }
     }
 
@@ -1613,19 +1867,9 @@ impl App {
         self.egui_pointer_moved = true;
         self.egui_pointer_down = true;
         self.egui_pointer_pressed = true;
-        if !self.settings_visible && event.button() == 0 && self.gallery.is_previewing() {
+        if event.button() == 0 && self.can_start_preview_drag() {
             let surface_pos = self.pointer_surface_pos(&event);
-            if Self::point_in_rect(surface_pos, self.last_billboard_canvas_rect) {
-                self.preview_dragging = true;
-                self.preview_drag_last_x = surface_pos[0];
-                self.preview_drag_last_time_secs = Self::event_time_secs(&event);
-                self.preview_drag_last_movement_time_secs = self.preview_drag_last_time_secs;
-                self.preview_rotation_velocity = 0.0;
-                self.preview_drag_anchor_rotation =
-                    self.preview_manual_rotation.unwrap_or_else(|| {
-                        Self::automatic_preview_rotation(self.current_preview_scene_time_secs())
-                    });
-            }
+            self.begin_preview_drag(surface_pos[0], Self::event_time_secs(&event));
         }
     }
 
@@ -1637,16 +1881,163 @@ impl App {
         if self.preview_dragging {
             let surface_pos = self.pointer_surface_pos(&event);
             let event_time_secs = Self::event_time_secs(&event);
-            self.record_preview_drag_sample(surface_pos[0], event_time_secs);
-            let release_was_still = event_time_secs - self.preview_drag_last_movement_time_secs
-                > PREVIEW_DRAG_RELEASE_MAX_STILL_SECS;
-            if release_was_still
-                || self.preview_rotation_velocity.abs() < PREVIEW_DRAG_RELEASE_MIN_VELOCITY
-            {
-                self.preview_rotation_velocity = 0.0;
-            }
+            self.end_preview_drag(surface_pos[0], event_time_secs);
         }
+    }
+
+    fn handle_touch_pointer_down(&mut self, event: PointerEvent) {
+        if !Self::drag_pointer_event_applies(&event)
+            || self.active_touch_identifier.is_some()
+            || self.active_touch_pointer_id.is_some()
+        {
+            return;
+        }
+
+        if self.can_start_preview_drag() {
+            let surface_pos = self.pointer_event_surface_pos(&event);
+            event.prevent_default();
+            let pos = self.pointer_event_egui_pos(&event);
+            self.egui_pointer_pos = Some(pos);
+            self.egui_pointer_moved = true;
+            self.egui_pointer_down = true;
+            self.egui_pointer_pressed = true;
+            let pointer_id = event.pointer_id();
+            self.active_touch_pointer_id = Some(pointer_id);
+            let _ = self.canvas.set_pointer_capture(pointer_id);
+            self.begin_preview_drag(surface_pos[0], Self::pointer_event_time_secs(&event));
+        }
+    }
+
+    fn handle_touch_pointer_move(&mut self, event: PointerEvent) {
+        if self.active_touch_pointer_id != Some(event.pointer_id()) {
+            return;
+        }
+
+        event.prevent_default();
+        let pos = self.pointer_event_egui_pos(&event);
+        if self.egui_pointer_pos != Some(pos) {
+            self.egui_pointer_pos = Some(pos);
+            self.egui_pointer_moved = true;
+        }
+        if self.preview_dragging {
+            let surface_pos = self.pointer_event_surface_pos(&event);
+            self.update_preview_drag(surface_pos[0], Self::pointer_event_time_secs(&event));
+        }
+    }
+
+    fn handle_touch_pointer_up(&mut self, event: PointerEvent) {
+        if self.active_touch_pointer_id != Some(event.pointer_id()) {
+            return;
+        }
+
+        event.prevent_default();
+        let pos = self.pointer_event_egui_pos(&event);
+        self.egui_pointer_pos = Some(pos);
+        self.egui_pointer_moved = true;
+        self.egui_pointer_down = false;
+        self.egui_pointer_released = true;
+        if self.preview_dragging {
+            let surface_pos = self.pointer_event_surface_pos(&event);
+            self.end_preview_drag(surface_pos[0], Self::pointer_event_time_secs(&event));
+        }
+        let pointer_id = event.pointer_id();
+        let _ = self.canvas.release_pointer_capture(pointer_id);
+        self.active_touch_pointer_id = None;
+    }
+
+    fn handle_touch_pointer_cancel(&mut self, event: PointerEvent) {
+        if self.active_touch_pointer_id != Some(event.pointer_id()) {
+            return;
+        }
+
+        event.prevent_default();
+        self.egui_pointer_down = false;
+        self.egui_pointer_released = true;
         self.preview_dragging = false;
+        self.preview_rotation_velocity = 0.0;
+        let pointer_id = event.pointer_id();
+        let _ = self.canvas.release_pointer_capture(pointer_id);
+        self.active_touch_pointer_id = None;
+    }
+
+    fn handle_touch_start(&mut self, event: TouchEvent) {
+        if self.active_touch_identifier.is_some()
+            || self.active_touch_pointer_id.is_some()
+            || !self.can_start_preview_drag()
+        {
+            return;
+        }
+
+        let Some(touch) = event.changed_touches().item(0) else {
+            return;
+        };
+        let surface_pos = self.touch_surface_pos(&touch);
+
+        event.prevent_default();
+        let pos = self.touch_egui_pos(&touch);
+        self.egui_pointer_pos = Some(pos);
+        self.egui_pointer_moved = true;
+        self.egui_pointer_down = true;
+        self.egui_pointer_pressed = true;
+        self.active_touch_identifier = Some(touch.identifier());
+        self.begin_preview_drag(surface_pos[0], Self::touch_event_time_secs(&event));
+    }
+
+    fn handle_touch_move(&mut self, event: TouchEvent) {
+        let Some(identifier) = self.active_touch_identifier else {
+            return;
+        };
+        let Some(touch) = Self::changed_touch_by_identifier(&event, identifier) else {
+            return;
+        };
+
+        event.prevent_default();
+        let pos = self.touch_egui_pos(&touch);
+        if self.egui_pointer_pos != Some(pos) {
+            self.egui_pointer_pos = Some(pos);
+            self.egui_pointer_moved = true;
+        }
+        if self.preview_dragging {
+            let surface_pos = self.touch_surface_pos(&touch);
+            self.update_preview_drag(surface_pos[0], Self::touch_event_time_secs(&event));
+        }
+    }
+
+    fn handle_touch_end(&mut self, event: TouchEvent) {
+        let Some(identifier) = self.active_touch_identifier else {
+            return;
+        };
+        let Some(touch) = Self::changed_touch_by_identifier(&event, identifier) else {
+            return;
+        };
+
+        event.prevent_default();
+        let pos = self.touch_egui_pos(&touch);
+        self.egui_pointer_pos = Some(pos);
+        self.egui_pointer_moved = true;
+        self.egui_pointer_down = false;
+        self.egui_pointer_released = true;
+        if self.preview_dragging {
+            let surface_pos = self.touch_surface_pos(&touch);
+            self.end_preview_drag(surface_pos[0], Self::touch_event_time_secs(&event));
+        }
+        self.active_touch_identifier = None;
+    }
+
+    fn handle_touch_cancel(&mut self, event: TouchEvent) {
+        let Some(identifier) = self.active_touch_identifier else {
+            return;
+        };
+        if Self::changed_touch_by_identifier(&event, identifier).is_none() {
+            return;
+        }
+
+        event.prevent_default();
+        self.egui_pointer_down = false;
+        self.egui_pointer_released = true;
+        self.preview_dragging = false;
+        self.preview_rotation_velocity = 0.0;
+        self.active_touch_identifier = None;
     }
 
     fn handle_wheel(&mut self, event: WheelEvent) {

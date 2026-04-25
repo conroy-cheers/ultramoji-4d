@@ -102,6 +102,7 @@ fn perturb_normal(geom_n: vec3f, uv: vec2f, face_type: u32) -> vec3f {
     return normalize(geom_n + tangent * tu + bitangent * tv);
 }
 
+// WEBGPU_SHADOW_MAP_AMOUNT_START
 fn shadow_map_amount(light_position: vec4f) -> f32 {
     if light_position.w <= 0.0 {
         return 0.0;
@@ -127,6 +128,7 @@ fn shadow_map_amount(light_position: vec4f) -> f32 {
     }
     return hits / samples;
 }
+// WEBGPU_SHADOW_MAP_AMOUNT_END
 
 fn shadow_map_factor(light_position: vec4f) -> f32 {
     if u.shadow_map_params.x < 0.5 || u.shadow_map_params.x >= 1.5 {
